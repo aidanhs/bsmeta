@@ -3,12 +3,14 @@
 #[macro_use]
 extern crate diesel;
 
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use decorum::R32;
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use dotenv::dotenv;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::env;
 use std::fs;
@@ -209,18 +211,38 @@ fn dl_deets() {
         .user_agent("aidanhsmetaclient/0.1 (@aidanhs on discord, aidanhs@cantab.net)")
         .build().expect("failed to create reqwest client");
 
+    fn load_blacklist() -> HashMap<String, String> {
+        serde_json::from_reader(fs::File::open("blacklist.json").expect("blacklist open failed")).expect("blacklist load failed")
+    }
+    fn save_blacklist(blacklist: &HashMap<String, String>) {
+        serde_json::to_writer(fs::File::create("blacklist.json").expect("blacklist open failed"), &blacklist).expect("blacklist save failed")
+    }
+    let mut blacklisted_keys = load_blacklist();
+
     //let song = to_download.into_iter().find(|s| s.key == "11b01").unwrap();
     for song in to_download {
+        if let Some(reason) = blacklisted_keys.get(&song.key) {
+            println!("Skipping song {} - previous failure: {}", song.key, reason);
+            continue
+        }
         println!("Considering song {}", song.key);
         println!("Getting song zip for {} {}", song.key, song.hash);
         let zipdata = match get_song_zip(&client, &song.key, &song.hash) {
-            Some(zd) => zd,
-            None => continue,
+            Ok(zd) => zd,
+            Err(e) => {
+                blacklisted_keys.insert(song.key, format!("get song zip failed: {}", e));
+                save_blacklist(&blacklisted_keys);
+                continue
+            },
         };
         println!("Converting zip for {} to dats tar", song.key);
         let (tardata, extra_meta) = match zip_to_dats_tar(&zipdata) {
-            Some((td, em)) => (td, em),
-            None => continue,
+            Ok((td, em)) => (td, em),
+            Err(e) => {
+                blacklisted_keys.insert(song.key, format!("zip to dats tar failed: {}", e));
+                save_blacklist(&blacklisted_keys);
+                continue
+            },
         };
         let key = song.key.clone();
         upsert_song(conn, song.key, song.hash, song.deleted, Some(tardata), Some(extra_meta));
@@ -229,8 +251,7 @@ fn dl_deets() {
     }
 }
 
-// TODO: should return an error
-fn get_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Option<Vec<u8>> {
+fn get_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Result<Vec<u8>> {
     //let url = format!("https://beatsaver.com/cdn/{}/{}.zip", key, hash);
     //println!("Retrieving {} from url {}", key, url);
     //let mut res = client.get(&url).send().expect("failed to send request");
@@ -255,7 +276,7 @@ fn get_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Op
 
         let headers = res.headers().to_owned();
         if res.status() == reqwest::StatusCode::NOT_FOUND {
-            return None
+            bail!("song not found from bsaber.org")
         }
         if !res.status().is_success() {
             println!("Response headers: {:?}", headers);
@@ -269,7 +290,7 @@ fn get_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Op
                 retry!()
             },
         };
-        return Some(bytes.as_ref().to_owned())
+        return Ok(bytes.as_ref().to_owned())
     }
 
     panic!("Failed to retrieve data");
@@ -280,23 +301,21 @@ fn get_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Op
     //zipdata
 }
 
-// TODO: result
-fn zip_to_dats_tar(zipdata: &[u8]) -> Option<(Vec<u8>, ExtraMeta)> {
+fn zip_to_dats_tar(zipdata: &[u8]) -> Result<(Vec<u8>, ExtraMeta)> {
     let zipreader = io::Cursor::new(zipdata);
     let mut zip = zip::ZipArchive::new(zipreader).expect("failed to load zip");
-    let dat_names: Vec<String> = zip.file_names()
-        .filter(|name| {
-            assert!(name.is_ascii(), "{}", name);
-            assert!(name.find("/").is_none() && name.find("\\").is_none(), "{}", name);
-            let name = name.to_lowercase();
-            if name.ends_with(".egg") || name.ends_with(".jpg") || name.ends_with(".jpeg") || name.ends_with(".png") {
-                false
-            } else {
-                assert!(name.ends_with(".dat"), "{}", name);
-                true
-            }
-        })
-        .map(str::to_owned).collect();
+    let mut dat_names: Vec<String> = vec![];
+    for name in zip.file_names() {
+        assert!(name.is_ascii(), "{}", name);
+        assert!(name.find("/").is_none() && name.find("\\").is_none(), "{}", name);
+        let lower_name = name.to_lowercase();
+        if lower_name.ends_with(".egg") || lower_name.ends_with(".jpg") || lower_name.ends_with(".jpeg") || lower_name.ends_with(".png") {
+            continue
+        } else if !lower_name.ends_with(".dat") {
+            bail!("odd file in zip: {}", name)
+        }
+        dat_names.push(name.to_owned())
+    }
     println!("Got dat names: {:?}", dat_names);
 
     let mut tar = tar::Builder::new(vec![]);
@@ -321,11 +340,10 @@ fn zip_to_dats_tar(zipdata: &[u8]) -> Option<(Vec<u8>, ExtraMeta)> {
     let zip_size = zipdata.len().try_into().expect("zup size too big");
     let extra_meta = ExtraMeta { song_duration, song_size, zip_size };
 
-    Some((tardata, extra_meta))
+    Ok((tardata, extra_meta))
 }
 
-// TODO: return err
-fn ogg_duration(ogg: &[u8]) -> Option<R32> {
+fn ogg_duration(ogg: &[u8]) -> Result<R32> {
     let ogg = io::Cursor::new(ogg);
     let mut srr = lewton::inside_ogg::OggStreamReader::new(ogg).expect("failed to create ogg stream reader");
 
@@ -333,14 +351,14 @@ fn ogg_duration(ogg: &[u8]) -> Option<R32> {
 
     let mut n = 0;
     let mut len_play = R32::from_inner(0.0);
-    while let Some(pck) = srr.read_dec_packet().ok()? /*.expect("failed to read packet")*/ {
+    while let Some(pck) = srr.read_dec_packet().context("failed to read packet")? {
         n += 1;
         // This is guaranteed by the docs
         assert_eq!(pck.len(), srr.ident_hdr.audio_channels as usize);
         len_play += pck[0].len() as f32 / srr.ident_hdr.audio_sample_rate as f32;
     }
     println!("The piece is {} s long ({} packets).", len_play, n);
-    Some(len_play)
+    Ok(len_play)
 }
 
 fn upsert_song(conn: &SqliteConnection, key: String, hash: String, deleted: bool, data: Option<Vec<u8>>, extra_meta: Option<ExtraMeta>) {
@@ -349,7 +367,7 @@ fn upsert_song(conn: &SqliteConnection, key: String, hash: String, deleted: bool
         key, hash, tstamp, deleted, data, extra_meta,
     };
 
-    let nrows = if let Some(mut cur_song) = get_song(&new_song.key) {
+    let nrows = if let Some(mut cur_song) = get_db_song(conn, &new_song.key) {
         assert_eq!((&new_song.key, &new_song.hash), (&cur_song.key, &cur_song.hash));
         cur_song.tstamp = tstamp;
         if cur_song == new_song {
@@ -367,13 +385,12 @@ fn upsert_song(conn: &SqliteConnection, key: String, hash: String, deleted: bool
     assert_eq!(nrows, 1, "{}", new_song.key)
 }
 
-fn get_song(song_key: &str) -> Option<Song> {
+fn get_db_song(conn: &SqliteConnection, song_key: &str) -> Option<Song> {
     use schema::tSong::dsl::*;
-    let conn = establish_connection();
 
     let mut results: Vec<Song> = tSong
         .filter(key.eq(song_key))
-        .load(&conn)
+        .load(conn)
         .expect("failed to load song");
     assert!(results.len() == 1 || results.is_empty());
     results.pop()
