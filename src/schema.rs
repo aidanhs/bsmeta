@@ -3,7 +3,8 @@ table! {
         key -> Text,
         hash -> Text,
         tstamp -> BigInt,
-        data -> Nullable<Binary>,
         deleted -> Bool,
+        data -> Nullable<Binary>,
+        extra_meta -> Nullable<Binary>,
     }
 }
