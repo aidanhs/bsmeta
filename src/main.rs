@@ -15,6 +15,7 @@ use std::convert::TryInto;
 use std::env;
 use std::fs;
 use std::io::{self, BufReader, Read};
+use std::str;
 use std::thread;
 use std::time;
 
@@ -41,6 +42,7 @@ mod models {
         pub deleted: bool,
         pub data: Option<Vec<u8>>,
         pub extra_meta: Option<ExtraMeta>,
+        pub zipdata: Option<Vec<u8>>,
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -51,6 +53,7 @@ mod models {
         pub song_duration: R32,
         pub song_size: u32,
         pub zip_size: u32,
+        pub zip_files: Vec<String>,
     }
 
     impl<DB> ToSql<Binary, DB> for ExtraMeta
@@ -79,6 +82,7 @@ mod models {
 use models::*;
 use schema::tSong;
 
+const DL_PAUSE_SECONDS: u64 = 10;
 
 #[derive(Deserialize)]
 struct RawSongData {
@@ -117,7 +121,7 @@ fn main() {
 fn loadjson() {
     let conn = establish_connection();
 
-    let f = fs::File::open("../songsdata.json").unwrap();
+    let f = fs::File::open("songsdata.json").unwrap();
     let buf = BufReader::new(f);
     let song_data: Vec<RawSongData> = serde_json::from_reader(buf).unwrap();
     for (i, RawSongData { song, post }) in song_data.into_iter().enumerate() {
@@ -129,7 +133,7 @@ fn loadjson() {
         let RawPost { post_status } = post.unwrap();
         assert!(post_status == "publish" || post_status == "draft" || post_status == "trash" || post_status == "private",
                 "{} {}", song_key, post_status);
-        upsert_song(&conn, song_key, song_hash, post_status != "publish", None, None);
+        upsert_song(&conn, song_key, song_hash, post_status != "publish", None, None, None);
     }
 }
 
@@ -219,7 +223,6 @@ fn dl_deets() {
     }
     let mut blacklisted_keys = load_blacklist();
 
-    //let song = to_download.into_iter().find(|s| s.key == "11b01").unwrap();
     for song in to_download {
         if let Some(reason) = blacklisted_keys.get(&song.key) {
             println!("Skipping song {} - previous failure: {}", song.key, reason);
@@ -245,9 +248,9 @@ fn dl_deets() {
             },
         };
         let key = song.key.clone();
-        upsert_song(conn, song.key, song.hash, song.deleted, Some(tardata), Some(extra_meta));
+        upsert_song(conn, song.key, song.hash, song.deleted, Some(tardata), Some(extra_meta), Some(zipdata));
         println!("Finished getting song {}", key);
-        thread::sleep(time::Duration::from_secs(60));
+        thread::sleep(time::Duration::from_secs(DL_PAUSE_SECONDS));
     }
 }
 
@@ -301,22 +304,33 @@ fn get_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Re
     //zipdata
 }
 
+const IMAGE_EXTS: &[&str] = &[".jpg", ".jpeg", ".png"];
+const OGG_EXTS: &[&str] = &[".egg"];
+
 fn zip_to_dats_tar(zipdata: &[u8]) -> Result<(Vec<u8>, ExtraMeta)> {
     let zipreader = io::Cursor::new(zipdata);
     let mut zip = zip::ZipArchive::new(zipreader).expect("failed to load zip");
     let mut dat_names: Vec<String> = vec![];
-    for name in zip.file_names() {
-        assert!(name.is_ascii(), "{}", name);
-        assert!(name.find("/").is_none() && name.find("\\").is_none(), "{}", name);
+    let mut all_names: Vec<String> = vec![];
+    for zip_index in 0..zip.len() {
+        let entry = zip.by_index(zip_index).context("failed to get entry from zip")?;
+        let name_bytes = entry.name_raw();
+        let name = str::from_utf8(name_bytes).context("failed to interpret name as utf8")?;
+        if !name.is_ascii() {
+            bail!("non-ascii name in zip: {}", name)
+        } else if entry.is_dir() || name.contains("/") || name.contains("\\") {
+            bail!("dir entry in zip: {}", name)
+        }
+
+        all_names.push(name.to_owned());
         let lower_name = name.to_lowercase();
-        if lower_name.ends_with(".egg") || lower_name.ends_with(".jpg") || lower_name.ends_with(".jpeg") || lower_name.ends_with(".png") {
-            continue
-        } else if !lower_name.ends_with(".dat") {
+        if lower_name.ends_with(".dat") {
+            dat_names.push(name.to_owned())
+        } else if !(IMAGE_EXTS.into_iter().chain(OGG_EXTS).any(|ext| lower_name.ends_with(ext))) {
             bail!("odd file in zip: {}", name)
         }
-        dat_names.push(name.to_owned())
     }
-    println!("Got dat names: {:?}", dat_names);
+    println!("Got dat names: {:?}, all names: {:?}", dat_names, all_names);
 
     let mut tar = tar::Builder::new(vec![]);
     for dat_name in dat_names {
@@ -330,15 +344,17 @@ fn zip_to_dats_tar(zipdata: &[u8]) -> Result<(Vec<u8>, ExtraMeta)> {
     }
     let tardata = tar.into_inner().expect("failed to finish tar");
 
-    let ogg_names: Vec<_> = zip.file_names().filter(|name| name.ends_with(".egg")).collect();
-    assert_eq!(ogg_names.len(), 1, "{:?}", ogg_names);
+    let ogg_names: Vec<_> = all_names.iter().filter(|name| OGG_EXTS.into_iter().any(|ext| name.to_lowercase().ends_with(ext))).collect();
+    if ogg_names.len() != 1 {
+        bail!("multiple oggs: {:?}", ogg_names)
+    }
     let ogg_name = ogg_names[0].to_owned();
     let mut oggdata = vec![];
     zip.by_name(&ogg_name).expect("failed to find ogg").read_to_end(&mut oggdata).expect("failed to read ogg");
     let song_duration = ogg_duration(&oggdata)?;
     let song_size = oggdata.len().try_into().expect("song size too big");
-    let zip_size = zipdata.len().try_into().expect("zup size too big");
-    let extra_meta = ExtraMeta { song_duration, song_size, zip_size };
+    let zip_size = zipdata.len().try_into().expect("zip size too big");
+    let extra_meta = ExtraMeta { song_duration, song_size, zip_size, zip_files: all_names };
 
     Ok((tardata, extra_meta))
 }
@@ -361,10 +377,10 @@ fn ogg_duration(ogg: &[u8]) -> Result<R32> {
     Ok(len_play)
 }
 
-fn upsert_song(conn: &SqliteConnection, key: String, hash: String, deleted: bool, data: Option<Vec<u8>>, extra_meta: Option<ExtraMeta>) {
+fn upsert_song(conn: &SqliteConnection, key: String, hash: String, deleted: bool, data: Option<Vec<u8>>, extra_meta: Option<ExtraMeta>, zipdata: Option<Vec<u8>>) {
     let tstamp = Utc::now().timestamp_millis();
     let new_song = Song {
-        key, hash, tstamp, deleted, data, extra_meta,
+        key, hash, tstamp, deleted, data, extra_meta, zipdata,
     };
 
     let nrows = if let Some(mut cur_song) = get_db_song(conn, &new_song.key) {

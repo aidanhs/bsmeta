@@ -6,5 +6,6 @@ table! {
         deleted -> Bool,
         data -> Nullable<Binary>,
         extra_meta -> Nullable<Binary>,
+        zipdata -> Nullable<Binary>,
     }
 }
