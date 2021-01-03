@@ -43,6 +43,15 @@ mod models {
         pub data: Option<Vec<u8>>,
         pub extra_meta: Option<ExtraMeta>,
         pub zipdata: Option<Vec<u8>>,
+        pub bsmeta: Option<Vec<u8>>,
+    }
+
+    #[derive(Identifiable)]
+    #[derive(Debug, Eq, PartialEq)]
+    #[primary_key(key)]
+    #[table_name="tSong"]
+    pub struct SongKey<'a> {
+        pub key: &'a str,
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -82,6 +91,7 @@ mod models {
 use models::*;
 use schema::tSong;
 
+const INFO_PAUSE_SECONDS: u64 = 3;
 const DL_PAUSE_SECONDS: u64 = 10;
 
 #[derive(Deserialize)]
@@ -112,7 +122,8 @@ fn main() {
             println!("Considering unknown keys");
             println!("Unknown keys: {:?}", unknown_songs().len());
         },
-        "dl" => dl_deets(),
+        "dl" => dl_data(),
+        "dlmeta" => dl_meta(),
         "analyse" => analyse_songs(),
         a => panic!("unknown arg {}", a),
     }
@@ -133,7 +144,7 @@ fn loadjson() {
         let RawPost { post_status } = post.unwrap();
         assert!(post_status == "publish" || post_status == "draft" || post_status == "trash" || post_status == "private",
                 "{} {}", song_key, post_status);
-        upsert_song(&conn, song_key, song_hash, post_status != "publish", None, None, None);
+        insert_song(&conn, song_key, song_hash, post_status != "publish", None);
     }
 }
 
@@ -196,7 +207,98 @@ fn analyse_songs() {
     }
 }
 
-fn dl_deets() {
+fn make_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .user_agent("aidanhsmetaclient/0.1 (@aidanhs#1789 on discord, aidanhs@cantab.net)")
+        .build().expect("failed to create reqwest client")
+}
+
+fn dl_meta() {
+    let conn = &establish_connection();
+
+    fn get_latest_maps(client: &reqwest::blocking::Client, page: usize) -> Result<Vec<u8>> {
+        let url = format!("https://beatsaver.com/api/maps/latest/{}", page);
+        let res = match client.get(&url).send() {
+            Ok(r) => r,
+            Err(e) => bail!("failed to send request: {}", e),
+        };
+        println!("Got response {}", res.status());
+
+        let headers = res.headers().to_owned();
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            bail!("song not found from bsaber.com")
+        }
+        if !res.status().is_success() {
+            bail!("non-success response: {:?}", headers)
+        }
+        let bytes = match res.bytes() {
+            Ok(bs) => bs,
+            Err(e) => bail!("failed to get bytes: {}, response headers: {:?}", e, headers),
+        };
+        return Ok(bytes.as_ref().to_owned())
+    }
+
+    #[derive(Deserialize)]
+    struct LatestResponse<'a> {
+        #[serde(borrow)]
+        docs: Vec<&'a serde_json::value::RawValue>
+    }
+    #[derive(Deserialize)]
+    struct Map {
+        key: String,
+        hash: String,
+    }
+
+    println!("Identifying new songs");
+    let client = make_client();
+    let mut page = 0;
+    let mut new_maps: Vec<(Map, Vec<u8>)> = vec![];
+    loop {
+        println!("Getting maps from page {}", page);
+        let maps_data = get_latest_maps(&client, page).expect("failed to get latest maps");
+        let res: LatestResponse = serde_json::from_slice(&maps_data).expect("failed to deserialize maps response");
+
+        let mut num_new = 0;
+        let num_maps = res.docs.len();
+        for map_value in res.docs {
+            let map: Map = serde_json::from_str(map_value.get()).expect("failed to interpret map value");
+            if get_db_song(conn, &map.key).is_none() {
+                println!("Found a new map: {}", map.key);
+                num_new += 1;
+                new_maps.push((map, map_value.get().as_bytes().to_owned()))
+            } else {
+                println!("Map {} already in db", map.key);
+                continue
+            }
+        }
+        println!("Got {} new maps", num_new);
+        if num_new < num_maps / 2 {
+            println!("Looks like we have all the new maps now, breaking");
+            break
+        }
+        page += 1;
+        thread::sleep(time::Duration::from_secs(INFO_PAUSE_SECONDS));
+    }
+
+    println!("Found {} new metas", new_maps.len());
+    while let Some((Map { key, hash }, raw_meta)) = new_maps.pop() {
+        insert_song(conn, key, hash, false, Some(raw_meta))
+    }
+
+    //println!("Finding song metas to download");
+    //let mut to_download: Vec<Song> = {
+    //    use schema::tSong::dsl::*;
+    //    tSong
+    //        .filter(bsmeta.is_null())
+    //        .filter(deleted.eq(false))
+    //        .load(conn).expect("failed to select keys")
+    //};
+    //println!("Got {} to download", to_download.len());
+    //to_download.sort_by_key(|s| key_to_num(&s.key));
+    //to_download.reverse();
+}
+
+fn dl_data() {
     let conn = &establish_connection();
 
     println!("Finding songs to download");
@@ -211,18 +313,15 @@ fn dl_deets() {
     to_download.sort_by_key(|s| key_to_num(&s.key));
     to_download.reverse();
 
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("aidanhsmetaclient/0.1 (@aidanhs on discord, aidanhs@cantab.net)")
-        .build().expect("failed to create reqwest client");
-
     fn load_blacklist() -> HashMap<String, String> {
         serde_json::from_reader(fs::File::open("blacklist.json").expect("blacklist open failed")).expect("blacklist load failed")
     }
     fn save_blacklist(blacklist: &HashMap<String, String>) {
         serde_json::to_writer(fs::File::create("blacklist.json").expect("blacklist open failed"), &blacklist).expect("blacklist save failed")
     }
-    let mut blacklisted_keys = load_blacklist();
 
+    let mut blacklisted_keys = load_blacklist();
+    let client = make_client();
     for song in to_download {
         if let Some(reason) = blacklisted_keys.get(&song.key) {
             println!("Skipping song {} - previous failure: {}", song.key, reason);
@@ -230,7 +329,7 @@ fn dl_deets() {
         }
         println!("Considering song {}", song.key);
         println!("Getting song zip for {} {}", song.key, song.hash);
-        let zipdata = match get_song_zip(&client, &song.key, &song.hash) {
+        let zipdata = match dl_song_zip(&client, &song.key, &song.hash) {
             Ok(zd) => zd,
             Err(e) => {
                 blacklisted_keys.insert(song.key, format!("get song zip failed: {}", e));
@@ -248,13 +347,13 @@ fn dl_deets() {
             },
         };
         let key = song.key.clone();
-        upsert_song(conn, song.key, song.hash, song.deleted, Some(tardata), Some(extra_meta), Some(zipdata));
+        set_song_data(conn, &song.key, tardata, extra_meta, zipdata);
         println!("Finished getting song {}", key);
         thread::sleep(time::Duration::from_secs(DL_PAUSE_SECONDS));
     }
 }
 
-fn get_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Result<Vec<u8>> {
+fn dl_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Result<Vec<u8>> {
     //let url = format!("https://beatsaver.com/cdn/{}/{}.zip", key, hash);
     //println!("Retrieving {} from url {}", key, url);
     //let mut res = client.get(&url).send().expect("failed to send request");
@@ -266,15 +365,25 @@ fn get_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Re
     //    println!("Got response {}", res.status());
     //}
 
-    macro_rules! retry {
-        () => {{ thread::sleep(time::Duration::from_secs(60)); continue }}
-    }
     let mut attempts = 2;
-    while attempts > 0 {
-        attempts -= 1;
+    macro_rules! retry {
+        ($e:expr) => {{
+            println!("request failure: {}", $e);
+            attempts -= 1;
+            if attempts == 0 {
+                panic!("failed to retrieve data")
+            }
+            thread::sleep(time::Duration::from_secs(DL_PAUSE_SECONDS));
+            continue
+        }};
+    }
+    loop {
         let url = format!("https://bsaber.org/files/cache/zip/{}.zip", key);
         println!("Retrieving {} from {}", key, url);
-        let res = client.get(&url).send().expect("failed to send request");
+        let res = match client.get(&url).send() {
+            Ok(r) => r,
+            Err(e) => retry!(format!("failed to send request: {}", e)),
+        };
         println!("Got response {}", res.status());
 
         let headers = res.headers().to_owned();
@@ -282,21 +391,14 @@ fn get_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Re
             bail!("song not found from bsaber.org")
         }
         if !res.status().is_success() {
-            println!("Response headers: {:?}", headers);
-            retry!()
+            retry!(format!("non-success response: {:?}", headers))
         }
         let bytes = match res.bytes() {
             Ok(bs) => bs,
-            Err(e) => {
-                println!("Failed to get bytes: {}", e);
-                println!("Response headers: {:?}", headers);
-                retry!()
-            },
+            Err(e) => retry!(format!("failed to get bytes: {}, response headers: {:?}", e, headers)),
         };
         return Ok(bytes.as_ref().to_owned())
     }
-
-    panic!("Failed to retrieve data");
 
     //println!("Retrieving {} from fs", key);
     //let path = format!("../beatmaps/{}.zip", hash);
@@ -377,27 +479,31 @@ fn ogg_duration(ogg: &[u8]) -> Result<R32> {
     Ok(len_play)
 }
 
-fn upsert_song(conn: &SqliteConnection, key: String, hash: String, deleted: bool, data: Option<Vec<u8>>, extra_meta: Option<ExtraMeta>, zipdata: Option<Vec<u8>>) {
+fn set_song_data(conn: &SqliteConnection, song_key: &str, new_data: Vec<u8>, new_extra_meta: ExtraMeta, new_zipdata: Vec<u8>) {
+    use schema::tSong::dsl::*;
+
+    let song = SongKey { key: song_key };
+    let nrows = diesel::update(&song)
+        .set((
+            data.eq(new_data),
+            extra_meta.eq(new_extra_meta),
+            zipdata.eq(new_zipdata),
+        ))
+        .execute(conn)
+        .expect("error updating song data");
+    assert_eq!(nrows, 1, "{:?}", song)
+}
+
+fn insert_song(conn: &SqliteConnection, key: String, hash: String, deleted: bool, bsmeta: Option<Vec<u8>>) {
     let tstamp = Utc::now().timestamp_millis();
     let new_song = Song {
-        key, hash, tstamp, deleted, data, extra_meta, zipdata,
+        key, hash, tstamp, deleted, data: None, extra_meta: None, zipdata: None, bsmeta,
     };
 
-    let nrows = if let Some(mut cur_song) = get_db_song(conn, &new_song.key) {
-        assert_eq!((&new_song.key, &new_song.hash), (&cur_song.key, &cur_song.hash));
-        cur_song.tstamp = tstamp;
-        if cur_song == new_song {
-            return
-        }
-        diesel::update(&new_song).set(&new_song)
-            .execute(conn)
-            .expect("error updating song")
-    } else {
-        diesel::insert_into(tSong::table)
-            .values(&new_song)
-            .execute(conn)
-            .expect("error saving song")
-    };
+    let nrows = diesel::insert_into(tSong::table)
+        .values(&new_song)
+        .execute(conn)
+        .expect("error saving song");
     assert_eq!(nrows, 1, "{}", new_song.key)
 }
 
@@ -413,10 +519,22 @@ fn get_db_song(conn: &SqliteConnection, song_key: &str) -> Option<Song> {
 }
 
 pub fn establish_connection() -> SqliteConnection {
+    use diesel::connection::SimpleConnection;
     dotenv().ok();
 
     let database_url = env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set");
-    SqliteConnection::establish(&database_url)
-        .expect(&format!("Error connecting to {}", database_url))
+    let conn = SqliteConnection::establish(&database_url)
+        .expect(&format!("Error connecting to {}", database_url));
+
+    conn.batch_execute("
+        PRAGMA journal_mode = WAL;          -- better write-concurrency
+        PRAGMA synchronous = NORMAL;        -- fsync only in critical moments
+        PRAGMA wal_autocheckpoint = 1000;   -- write WAL changes back every 1000 pages, for an in average 1MB WAL file. May affect readers if number is increased
+        PRAGMA wal_checkpoint(TRUNCATE);    -- free some space by truncating possibly massive WAL files from the last run.
+        PRAGMA busy_timeout = 250;          -- sleep if the database is busy
+        PRAGMA foreign_keys = ON;           -- enforce foreign keys
+    ").expect("couldn't set up connection");
+
+    conn
 }

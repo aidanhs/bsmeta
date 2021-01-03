@@ -7,5 +7,6 @@ table! {
         data -> Nullable<Binary>,
         extra_meta -> Nullable<Binary>,
         zipdata -> Nullable<Binary>,
+        bsmeta -> Nullable<Binary>,
     }
 }
