@@ -90,7 +90,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bsmetadl"
+name = "bsmeta"
 version = "0.1.0"
 dependencies = [
  "anyhow",

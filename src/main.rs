@@ -209,7 +209,7 @@ fn analyse_songs() {
 
 fn make_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        .user_agent("aidanhsmetaclient/0.1 (@aidanhs#1789 on discord, aidanhs@cantab.net)")
+        .user_agent("aidanhsmetaclient/0.1 (@aidanhs#1789 on discord, aidanhs@cantab.net, https://github.com/aidanhs/bsmeta)")
         .build().expect("failed to create reqwest client")
 }
 
@@ -286,16 +286,28 @@ fn dl_meta() {
     }
 
     //println!("Finding song metas to download");
-    //let mut to_download: Vec<Song> = {
+    //let (first_id, to_download): (String, Vec<String>) = {
     //    use schema::tSong::dsl::*;
-    //    tSong
-    //        .filter(bsmeta.is_null())
-    //        .filter(deleted.eq(false))
-    //        .load(conn).expect("failed to select keys")
+    //    (
+    //        tSong.select(max(key)),
+    //        tSong
+    //            .select(key)
+    //            .filter(bsmeta.is_null())
+    //            .filter(deleted.eq(false))
+    //            .load::<String>(conn).expect("failed to select keys")
+    //    )
     //};
     //println!("Got {} to download", to_download.len());
-    //to_download.sort_by_key(|s| key_to_num(&s.key));
-    //to_download.reverse();
+    //let to_download: BTreeSet<_> = to_download.into_iter().map(key_to_num).collect();
+    //while let Some(target) = to_download.pop_last() {
+
+    //    // loop
+    //    //   get a page
+    //    //     (handle everything)
+    //    //   if it included target, break
+    //    //   guess how far back/forward we need to go
+    //    //
+    //}
 }
 
 fn dl_data() {

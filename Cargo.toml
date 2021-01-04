@@ -1,5 +1,5 @@
 [package]
-name = "bsmetadl"
+name = "bsmeta"
 version = "0.1.0"
 authors = ["Aidan Hobson Sayers <aidanhs@cantab.net>"]
 edition = "2018"
