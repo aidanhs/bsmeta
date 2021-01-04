@@ -1,7 +1,7 @@
 table! {
     tSong (key) {
         key -> Text,
-        hash -> Text,
+        hash -> Nullable<Text>,
         tstamp -> BigInt,
         deleted -> Bool,
         data -> Nullable<Binary>,

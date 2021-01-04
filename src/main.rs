@@ -37,7 +37,7 @@ mod models {
     #[changeset_options(treat_none_as_null="true")]
     pub struct Song {
         pub key: String,
-        pub hash: String,
+        pub hash: Option<String>,
         pub tstamp: i64,
         pub deleted: bool,
         pub data: Option<Vec<u8>>,
@@ -144,7 +144,7 @@ fn loadjson() {
         let RawPost { post_status } = post.unwrap();
         assert!(post_status == "publish" || post_status == "draft" || post_status == "trash" || post_status == "private",
                 "{} {}", song_key, post_status);
-        insert_song(&conn, song_key, song_hash, post_status != "publish", None);
+        insert_song(&conn, song_key, Some(song_hash), post_status != "publish", None);
     }
 }
 
@@ -282,7 +282,7 @@ fn dl_meta() {
 
     println!("Found {} new metas", new_maps.len());
     while let Some((Map { key, hash }, raw_meta)) = new_maps.pop() {
-        insert_song(conn, key, hash, false, Some(raw_meta))
+        insert_song(conn, key, Some(hash), false, Some(raw_meta))
     }
 
     //println!("Finding song metas to download");
@@ -305,6 +305,7 @@ fn dl_data() {
     let mut to_download: Vec<Song> = {
         use schema::tSong::dsl::*;
         tSong
+            .filter(hash.is_not_null())
             .filter(data.is_null())
             .filter(deleted.eq(false))
             .load(conn).expect("failed to select keys")
@@ -323,13 +324,14 @@ fn dl_data() {
     let mut blacklisted_keys = load_blacklist();
     let client = make_client();
     for song in to_download {
+        let hash = song.hash.expect("non-null hash was None");
         if let Some(reason) = blacklisted_keys.get(&song.key) {
             println!("Skipping song {} - previous failure: {}", song.key, reason);
             continue
         }
         println!("Considering song {}", song.key);
-        println!("Getting song zip for {} {}", song.key, song.hash);
-        let zipdata = match dl_song_zip(&client, &song.key, &song.hash) {
+        println!("Getting song zip for {} {}", song.key, hash);
+        let zipdata = match dl_song_zip(&client, &song.key, &hash) {
             Ok(zd) => zd,
             Err(e) => {
                 blacklisted_keys.insert(song.key, format!("get song zip failed: {}", e));
@@ -494,7 +496,7 @@ fn set_song_data(conn: &SqliteConnection, song_key: &str, new_data: Vec<u8>, new
     assert_eq!(nrows, 1, "{:?}", song)
 }
 
-fn insert_song(conn: &SqliteConnection, key: String, hash: String, deleted: bool, bsmeta: Option<Vec<u8>>) {
+fn insert_song(conn: &SqliteConnection, key: String, hash: Option<String>, deleted: bool, bsmeta: Option<Vec<u8>>) {
     let tstamp = Utc::now().timestamp_millis();
     let new_song = Song {
         key, hash, tstamp, deleted, data: None, extra_meta: None, zipdata: None, bsmeta,
