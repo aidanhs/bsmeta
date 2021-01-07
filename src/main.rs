@@ -484,7 +484,7 @@ fn zip_to_dats_tar(zipdata: &[u8]) -> Result<(Vec<u8>, ExtraMeta)> {
 
 fn ogg_duration(ogg: &[u8]) -> Result<R32> {
     let ogg = io::Cursor::new(ogg);
-    let mut srr = lewton::inside_ogg::OggStreamReader::new(ogg).expect("failed to create ogg stream reader");
+    let mut srr = lewton::inside_ogg::OggStreamReader::new(ogg).context("failed to create ogg stream reader")?;
 
     println!("Sample rate: {}", srr.ident_hdr.audio_sample_rate);
 
