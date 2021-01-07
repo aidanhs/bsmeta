@@ -28,7 +28,7 @@ mod models {
     use diesel::sql_types::Binary;
     use serde::{Deserialize, Serialize};
     use std::io::Write;
-    use super::schema::tSong;
+    use super::schema::{tSong, tSongData};
 
     #[derive(AsChangeset, Identifiable, Insertable, Queryable)]
     #[derive(Debug, Eq, PartialEq)]
@@ -36,22 +36,25 @@ mod models {
     #[table_name="tSong"]
     #[changeset_options(treat_none_as_null="true")]
     pub struct Song {
-        pub key: String,
+        // TODO: make this u32
+        pub key: i32,
         pub hash: Option<String>,
         pub tstamp: i64,
         pub deleted: bool,
-        pub data: Option<Vec<u8>>,
-        pub extra_meta: Option<ExtraMeta>,
-        pub zipdata: Option<Vec<u8>>,
         pub bsmeta: Option<Vec<u8>>,
     }
 
-    #[derive(Identifiable)]
+    #[derive(AsChangeset, Identifiable, Insertable, Queryable)]
     #[derive(Debug, Eq, PartialEq)]
     #[primary_key(key)]
-    #[table_name="tSong"]
-    pub struct SongKey<'a> {
-        pub key: &'a str,
+    #[table_name="tSongData"]
+    #[changeset_options(treat_none_as_null="true")]
+    pub struct SongData {
+        // TODO: make this u32
+        pub key: i32,
+        pub zipdata: Vec<u8>,
+        pub data: Vec<u8>,
+        pub extra_meta: ExtraMeta,
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -89,7 +92,7 @@ mod models {
 }
 
 use models::*;
-use schema::tSong;
+use schema::{tSong, tSongData};
 
 const INFO_PAUSE_SECONDS: u64 = 3;
 const DL_PAUSE_SECONDS: u64 = 10;
@@ -144,15 +147,16 @@ fn loadjson() {
         let RawPost { post_status } = post.unwrap();
         assert!(post_status == "publish" || post_status == "draft" || post_status == "trash" || post_status == "private",
                 "{} {}", song_key, post_status);
-        insert_song(&conn, song_key, Some(song_hash), post_status != "publish", None);
+        insert_song(&conn, key_to_num(&song_key), Some(song_hash), post_status != "publish", None);
     }
 }
 
-fn key_to_num<T: AsRef<str>>(k: &T) -> u64 {
-    u64::from_str_radix(k.as_ref(), 16).expect("can't parse key")
+fn key_to_num<T: AsRef<str>>(k: &T) -> i32 {
+    u32::from_str_radix(k.as_ref(), 16).expect("can't parse key").try_into().expect("too big for i32")
 }
 
-fn num_to_key(n: u64) -> String {
+fn num_to_key(n: i32) -> String {
+    assert!(n >= 0);
     format!("{:x}", n)
 }
 
@@ -160,18 +164,17 @@ fn unknown_songs() -> Vec<String> {
     use schema::tSong::dsl::*;
     let conn = establish_connection();
 
-    let mut results: Vec<String> = tSong.select(key).load(&conn).expect("failed to select keys");
+    let mut results: Vec<i32> = tSong.select(key).load(&conn).expect("failed to select keys");
     println!("Loaded keys");
-    results.sort_by_key(key_to_num);
+    results.sort();
 
     let mut unknown = vec![];
     let mut cur = 1;
     results.reverse();
     let mut next_target = results.pop();
-    while let Some(target) = &next_target {
-        let target_num = key_to_num(target);
-        assert!(cur <= target_num);
-        if cur == target_num {
+    while let Some(target) = next_target {
+        assert!(cur <= target);
+        if cur == target {
             next_target = results.pop()
         } else {
             unknown.push(cur);
@@ -185,17 +188,17 @@ fn analyse_songs() {
     println!("Analysing songs");
     let conn = &establish_connection();
 
-    let to_analyse: Vec<Song> = {
-        use schema::tSong::dsl::*;
+    let to_analyse: Vec<(Song, SongData)> = {
+        use schema::tSong::{self, dsl::*};
+        use schema::tSongData::{self, dsl::*};
         tSong
-            .filter(data.is_not_null())
+            .inner_join(tSongData)
             .filter(deleted.eq(false))
             .load(conn).expect("failed to select keys")
     };
 
-    for song in to_analyse {
-        let data = song.data.expect("no song data");
-        let mut tar = tar::Archive::new(&*data);
+    for (_song, songdata) in to_analyse {
+        let mut tar = tar::Archive::new(&*songdata.data);
         let mut names_lens = vec![];
         for entry in tar.entries().expect("couldn't iterate over entries") {
             let entry = entry.expect("error getting entry");
@@ -262,7 +265,7 @@ fn dl_meta() {
         let num_maps = res.docs.len();
         for map_value in res.docs {
             let map: Map = serde_json::from_str(map_value.get()).expect("failed to interpret map value");
-            if get_db_song(conn, &map.key).is_none() {
+            if get_db_song(conn, key_to_num(&map.key)).is_none() {
                 println!("Found a new map: {}", map.key);
                 num_new += 1;
                 new_maps.push((map, map_value.get().as_bytes().to_owned()))
@@ -282,7 +285,8 @@ fn dl_meta() {
 
     println!("Found {} new metas", new_maps.len());
     while let Some((Map { key, hash }, raw_meta)) = new_maps.pop() {
-        insert_song(conn, key, Some(hash), false, Some(raw_meta))
+        println!("Upserting {}", key);
+        upsert_song(conn, key_to_num(&key), Some(hash), false, Some(raw_meta))
     }
 
     //println!("Finding song metas to download");
@@ -314,16 +318,19 @@ fn dl_data() {
     let conn = &establish_connection();
 
     println!("Finding songs to download");
-    let mut to_download: Vec<Song> = {
-        use schema::tSong::dsl::*;
+    let to_download: Vec<(Song, Option<SongData>)> = {
+        use schema::tSong::{self, dsl::*};
+        use schema::tSongData::{self, dsl::*};
         tSong
-            .filter(hash.is_not_null())
-            .filter(data.is_null())
+            .left_join(tSongData)
+            .filter(tSong::hash.is_not_null())
+            .filter(tSongData::key.is_null())
             .filter(deleted.eq(false))
             .load(conn).expect("failed to select keys")
     };
+    let mut to_download: Vec<Song> = to_download.into_iter().map(|(s, _sd)| s).collect();
     println!("Got {} to download", to_download.len());
-    to_download.sort_by_key(|s| key_to_num(&s.key));
+    to_download.sort_by_key(|s| s.key);
     to_download.reverse();
 
     fn load_blacklist() -> HashMap<String, String> {
@@ -336,17 +343,18 @@ fn dl_data() {
     let mut blacklisted_keys = load_blacklist();
     let client = make_client();
     for song in to_download {
+        let key_str = num_to_key(song.key);
         let hash = song.hash.expect("non-null hash was None");
-        if let Some(reason) = blacklisted_keys.get(&song.key) {
+        if let Some(reason) = blacklisted_keys.get(&key_str) {
             println!("Skipping song {} - previous failure: {}", song.key, reason);
             continue
         }
         println!("Considering song {}", song.key);
         println!("Getting song zip for {} {}", song.key, hash);
-        let zipdata = match dl_song_zip(&client, &song.key, &hash) {
+        let zipdata = match dl_song_zip(&client, &key_str, &hash) {
             Ok(zd) => zd,
             Err(e) => {
-                blacklisted_keys.insert(song.key, format!("get song zip failed: {}", e));
+                blacklisted_keys.insert(key_str.clone(), format!("get song zip failed: {}", e));
                 save_blacklist(&blacklisted_keys);
                 continue
             },
@@ -355,14 +363,13 @@ fn dl_data() {
         let (tardata, extra_meta) = match zip_to_dats_tar(&zipdata) {
             Ok((td, em)) => (td, em),
             Err(e) => {
-                blacklisted_keys.insert(song.key, format!("zip to dats tar failed: {}", e));
+                blacklisted_keys.insert(key_str.clone(), format!("zip to dats tar failed: {}", e));
                 save_blacklist(&blacklisted_keys);
                 continue
             },
         };
-        let key = song.key.clone();
-        set_song_data(conn, &song.key, tardata, extra_meta, zipdata);
-        println!("Finished getting song {}", key);
+        set_song_data(conn, song.key, tardata, extra_meta, zipdata);
+        println!("Finished getting song {}", song.key);
         thread::sleep(time::Duration::from_secs(DL_PAUSE_SECONDS));
     }
 }
@@ -493,27 +500,26 @@ fn ogg_duration(ogg: &[u8]) -> Result<R32> {
     Ok(len_play)
 }
 
-fn set_song_data(conn: &SqliteConnection, song_key: &str, new_data: Vec<u8>, new_extra_meta: ExtraMeta, new_zipdata: Vec<u8>) {
-    use schema::tSong::dsl::*;
-
-    let song = SongKey { key: song_key };
-    let nrows = diesel::update(&song)
-        .set((
-            data.eq(new_data),
-            extra_meta.eq(new_extra_meta),
-            zipdata.eq(new_zipdata),
-        ))
+fn set_song_data(conn: &SqliteConnection, key: i32, data: Vec<u8>, extra_meta: ExtraMeta, zipdata: Vec<u8>) {
+    let songdata = SongData { key, zipdata, data, extra_meta };
+    let nrows = diesel::insert_into(tSongData::table)
+        .values(&songdata)
         .execute(conn)
         .expect("error updating song data");
-    assert_eq!(nrows, 1, "{:?}", song)
+    assert_eq!(nrows, 1, "{:?}", songdata)
 }
 
-fn insert_song(conn: &SqliteConnection, key: String, hash: Option<String>, deleted: bool, bsmeta: Option<Vec<u8>>) {
-    let tstamp = Utc::now().timestamp_millis();
-    let new_song = Song {
-        key, hash, tstamp, deleted, data: None, extra_meta: None, zipdata: None, bsmeta,
-    };
+fn upsert_song(conn: &SqliteConnection, key: i32, hash: Option<String>, deleted: bool, bsmeta: Option<Vec<u8>>) {
+    let new_song = Song { key, hash, tstamp: Utc::now().timestamp_millis(), deleted, bsmeta };
+    let nrows = diesel::replace_into(tSong::table)
+        .values(&new_song)
+        .execute(conn)
+        .expect("error saving song");
+    assert_eq!(nrows, 1, "{}", new_song.key)
+}
 
+fn insert_song(conn: &SqliteConnection, key: i32, hash: Option<String>, deleted: bool, bsmeta: Option<Vec<u8>>) {
+    let new_song = Song { key, hash, tstamp: Utc::now().timestamp_millis(), deleted, bsmeta };
     let nrows = diesel::insert_into(tSong::table)
         .values(&new_song)
         .execute(conn)
@@ -521,15 +527,12 @@ fn insert_song(conn: &SqliteConnection, key: String, hash: Option<String>, delet
     assert_eq!(nrows, 1, "{}", new_song.key)
 }
 
-fn get_db_song(conn: &SqliteConnection, song_key: &str) -> Option<Song> {
+fn get_db_song(conn: &SqliteConnection, song_key: i32) -> Option<Song> {
     use schema::tSong::dsl::*;
-
-    let mut results: Vec<Song> = tSong
-        .filter(key.eq(song_key))
-        .load(conn)
-        .expect("failed to load song");
-    assert!(results.len() == 1 || results.is_empty());
-    results.pop()
+    tSong
+        .find(song_key)
+        .first(conn).optional()
+        .expect("failed to load song")
 }
 
 pub fn establish_connection() -> SqliteConnection {

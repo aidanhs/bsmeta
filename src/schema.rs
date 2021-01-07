@@ -1,12 +1,25 @@
 table! {
     tSong (key) {
-        key -> Text,
+        key -> Integer,
         hash -> Nullable<Text>,
         tstamp -> BigInt,
         deleted -> Bool,
-        data -> Nullable<Binary>,
-        extra_meta -> Nullable<Binary>,
-        zipdata -> Nullable<Binary>,
         bsmeta -> Nullable<Binary>,
     }
 }
+
+table! {
+    tSongData (key) {
+        key -> Integer,
+        zipdata -> Binary,
+        data -> Binary,
+        extra_meta -> Binary,
+    }
+}
+
+joinable!(tSongData -> tSong (key));
+
+allow_tables_to_appear_in_same_query!(
+    tSong,
+    tSongData,
+);

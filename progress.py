@@ -13,7 +13,7 @@ def go():
     cur = conn.cursor()
 
     print('fetching counts')
-    cur.execute("select count(*), sum(length(data))/1024, sum(length(zipdata))/1024 from tsong where tsong.data is not null")
+    cur.execute("select count(*), sum(length(data))/1024, sum(length(zipdata))/1024 from tsong s, tsongdata sd where s.key = sd.key")
     fetched_songs, meta_size_kb, total_size_kb = cur.fetchone()
     cur.execute("select count(*) from tsong where tsong.deleted = 0")
     total_songs, = cur.fetchone()
