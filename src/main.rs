@@ -14,11 +14,12 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::env;
 use std::fs;
-use std::io::{self, BufReader, Read};
+use std::io::{self, Read};
 use std::str;
 use std::thread;
 use std::time;
 
+mod scripts;
 mod schema;
 mod models {
     use decorum::R32;
@@ -97,30 +98,13 @@ use schema::{tSong, tSongData};
 const INFO_PAUSE_SECONDS: u64 = 3;
 const DL_PAUSE_SECONDS: u64 = 10;
 
-#[derive(Deserialize)]
-struct RawSongData {
-    song: RawSong,
-    post: Option<RawPost>,
-}
-
-#[derive(Deserialize)]
-struct RawSong {
-    song_key: String,
-    song_hash: String,
-}
-
-#[derive(Deserialize)]
-struct RawPost {
-    post_status: String,
-}
-
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         panic!("wrong num of args")
     }
     match args[1].as_str() {
-        "loadjson" => loadjson(),
+        "loadjson" => scripts::loadjson(),
         "unknown" => {
             println!("Considering unknown keys");
             println!("Unknown keys: {:?}", unknown_songs().len());
@@ -129,25 +113,6 @@ fn main() {
         "dlmeta" => dl_meta(),
         "analyse" => analyse_songs(),
         a => panic!("unknown arg {}", a),
-    }
-}
-
-fn loadjson() {
-    let conn = establish_connection();
-
-    let f = fs::File::open("songsdata.json").unwrap();
-    let buf = BufReader::new(f);
-    let song_data: Vec<RawSongData> = serde_json::from_reader(buf).unwrap();
-    for (i, RawSongData { song, post }) in song_data.into_iter().enumerate() {
-        if i % 100 == 0 {
-            println!("At song: {}", i+1)
-        }
-        let RawSong { song_key, song_hash } = song;
-        if post.is_none() { continue }
-        let RawPost { post_status } = post.unwrap();
-        assert!(post_status == "publish" || post_status == "draft" || post_status == "trash" || post_status == "private",
-                "{} {}", song_key, post_status);
-        insert_song(&conn, key_to_num(&song_key), Some(song_hash), post_status != "publish", None);
     }
 }
 
