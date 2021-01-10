@@ -15,6 +15,7 @@ use std::convert::TryInto;
 use std::env;
 use std::fs;
 use std::io::{self, Read};
+use std::path::Path;
 use std::str;
 use std::thread;
 use std::time;
@@ -184,52 +185,16 @@ fn make_client() -> reqwest::blocking::Client {
 fn dl_meta() {
     let conn = &establish_connection();
 
-    fn get_latest_maps(client: &reqwest::blocking::Client, page: usize) -> Result<Vec<u8>> {
-        let url = format!("https://beatsaver.com/api/maps/latest/{}", page);
-        let res = match client.get(&url).send() {
-            Ok(r) => r,
-            Err(e) => bail!("failed to send request: {}", e),
-        };
-        println!("Got response {}", res.status());
-
-        let headers = res.headers().to_owned();
-        if res.status() == reqwest::StatusCode::NOT_FOUND {
-            bail!("song not found from bsaber.com")
-        }
-        if !res.status().is_success() {
-            bail!("non-success response: {:?}", headers)
-        }
-        let bytes = match res.bytes() {
-            Ok(bs) => bs,
-            Err(e) => bail!("failed to get bytes: {}, response headers: {:?}", e, headers),
-        };
-        return Ok(bytes.as_ref().to_owned())
-    }
-
-    #[derive(Deserialize)]
-    struct LatestResponse<'a> {
-        #[serde(borrow)]
-        docs: Vec<&'a serde_json::value::RawValue>
-    }
-    #[derive(Deserialize)]
-    struct Map {
-        key: String,
-        hash: String,
-    }
-
     println!("Identifying new songs");
     let client = make_client();
     let mut page = 0;
-    let mut new_maps: Vec<(Map, Vec<u8>)> = vec![];
+    let mut new_maps: Vec<(BeatSaverMap, Vec<u8>)> = vec![];
     loop {
-        println!("Getting maps from page {}", page);
-        let maps_data = get_latest_maps(&client, page).expect("failed to get latest maps");
-        let res: LatestResponse = serde_json::from_slice(&maps_data).expect("failed to deserialize maps response");
+        let res = get_latest_maps(&client, page).expect("failed to get latest maps");
 
         let mut num_new = 0;
         let num_maps = res.docs.len();
-        for map_value in res.docs {
-            let map: Map = serde_json::from_str(map_value.get()).expect("failed to interpret map value");
+        for (map, map_value) in res.docs {
             if get_db_song(conn, key_to_num(&map.key)).is_none() {
                 println!("Found a new map: {}", map.key);
                 num_new += 1;
@@ -249,7 +214,7 @@ fn dl_meta() {
     }
 
     println!("Found {} new metas", new_maps.len());
-    while let Some((Map { key, hash }, raw_meta)) = new_maps.pop() {
+    while let Some((BeatSaverMap { key, hash }, raw_meta)) = new_maps.pop() {
         println!("Upserting {}", key);
         upsert_song(conn, key_to_num(&key), Some(hash), false, Some(raw_meta))
     }
@@ -316,7 +281,7 @@ fn dl_data() {
         }
         println!("Considering song {}", song.key);
         println!("Getting song zip for {} {}", song.key, hash);
-        let zipdata = match dl_song_zip(&client, &key_str, &hash) {
+        let zipdata = match get_song_zip(&client, &key_str, &hash) {
             Ok(zd) => zd,
             Err(e) => {
                 blacklisted_keys.insert(key_str.clone(), format!("get song zip failed: {}", e));
@@ -339,7 +304,33 @@ fn dl_data() {
     }
 }
 
-fn dl_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Result<Vec<u8>> {
+// TODO: do this by implementing a Deserializer that creates a visitor that dispatches to two sub
+// visitors
+fn splitde<'de, D>(de: D) -> Result<Vec<(BeatSaverMap, Box<serde_json::value::RawValue>)>, D::Error> where D: serde::Deserializer<'de> {
+    use serde::de::Error;
+    let raws = Vec::<Box<serde_json::value::RawValue>>::deserialize(de)?;
+    let all: Vec<_> = raws.into_iter()
+        .map(|rv| {
+            serde_json::from_str(rv.get())
+                .map(|m| (m, rv))
+                .map_err(|e| D::Error::custom(e))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(all)
+}
+
+#[derive(Deserialize)]
+struct BeatSaverLatestResponse {
+    #[serde(deserialize_with = "splitde")]
+    docs: Vec<(BeatSaverMap, Box<serde_json::value::RawValue>)>,
+}
+#[derive(Deserialize)]
+struct BeatSaverMap {
+    key: String,
+    hash: String,
+}
+
+fn get_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Result<Vec<u8>> {
     //let url = format!("https://beatsaver.com/cdn/{}/{}.zip", key, hash);
     //println!("Retrieving {} from url {}", key, url);
     //let mut res = client.get(&url).send().expect("failed to send request");
@@ -390,6 +381,33 @@ fn dl_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Res
     //let path = format!("../beatmaps/{}.zip", hash);
     //let zipdata = fs::read(path).unwrap();
     //zipdata
+}
+
+fn get_latest_maps(client: &reqwest::blocking::Client, page: usize) -> Result<BeatSaverLatestResponse> {
+    println!("Getting maps from page {}", page);
+
+    let url = format!("https://beatsaver.com/api/maps/latest/{}", page);
+    let res = match client.get(&url).send() {
+        Ok(r) => r,
+        Err(e) => bail!("failed to send request: {}", e),
+    };
+    println!("Got response {}", res.status());
+
+    let headers = res.headers().to_owned();
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        bail!("latest maps page not found from beatsaver")
+    }
+    if !res.status().is_success() {
+        bail!("non-success response: {:?}", headers)
+    }
+    let bytes = match res.bytes() {
+        Ok(bs) => bs,
+        Err(e) => bail!("failed to get bytes: {}, response headers: {:?}", e, headers),
+    };
+    let bytes = bytes.as_ref();
+    let res = serde_json::from_slice(bytes)
+        .with_context(|| format!("failed to deserialize maps response: {:?}", String::from_utf8_lossy(bytes)))?;
+    Ok(res)
 }
 
 const IMAGE_EXTS: &[&str] = &[".jpg", ".jpeg", ".png"];
