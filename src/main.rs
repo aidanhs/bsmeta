@@ -99,6 +99,9 @@ use models::*;
 const INFO_PAUSE: time::Duration = time::Duration::from_secs(3);
 const DL_PAUSE: time::Duration = time::Duration::from_secs(10);
 
+// Additional padding to apply when ratelimited, to prove we're being a good citizen
+const RATELIMIT_PADDING: time::Duration = time::Duration::from_secs(5);
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
@@ -469,7 +472,7 @@ fn ratelimit_pause(headers: &reqwest::header::HeaderMap) -> Result<time::Duratio
         .ok_or_else(|| anyhow!("no ratelimit header with too many requests response: {:?}", headers))?;
     let r = r.to_str().with_context(|| format!("ratelimit header couldn't be interpreted as ascii: {:?}", headers))?;
     let r: u64 = r.parse().with_context(|| format!("failed to parse ratelimit as i64: {:?}", headers))?;
-    Ok(time::Duration::from_millis(r + 1000)) // pad for safety
+    Ok(time::Duration::from_millis(r) + RATELIMIT_PADDING) // pad for safety
 }
 
 const IMAGE_EXTS: &[&str] = &[".jpg", ".jpeg", ".png"];
