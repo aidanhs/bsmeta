@@ -3,7 +3,7 @@
 #[macro_use]
 extern crate diesel;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use decorum::R32;
 use diesel::prelude::*;
@@ -21,6 +21,7 @@ use std::thread;
 use std::time;
 
 mod scripts;
+#[allow(non_snake_case)]
 mod schema;
 mod models {
     use decorum::R32;
@@ -94,10 +95,9 @@ mod models {
 }
 
 use models::*;
-use schema::{tSong, tSongData};
 
-const INFO_PAUSE_SECONDS: u64 = 3;
-const DL_PAUSE_SECONDS: u64 = 10;
+const INFO_PAUSE: time::Duration = time::Duration::from_secs(3);
+const DL_PAUSE: time::Duration = time::Duration::from_secs(10);
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -105,7 +105,8 @@ fn main() {
         panic!("wrong num of args")
     }
     match args[1].as_str() {
-        "loadjson" => scripts::loadjson(),
+        "script-loadjson" => scripts::loadjson(),
+        "script-checkdeleted" => scripts::checkdeleted(),
         "unknown" => {
             println!("Considering unknown keys");
             println!("Unknown keys: {:?}", unknown_songs().len());
@@ -126,7 +127,7 @@ fn num_to_key(n: i32) -> String {
     format!("{:x}", n)
 }
 
-fn unknown_songs() -> Vec<String> {
+fn unknown_songs() -> Vec<i32> {
     use schema::tSong::dsl::*;
     let conn = establish_connection();
 
@@ -147,7 +148,7 @@ fn unknown_songs() -> Vec<String> {
         }
         cur += 1;
     }
-    unknown.into_iter().map(num_to_key).collect()
+    unknown
 }
 
 fn analyse_songs() {
@@ -155,8 +156,8 @@ fn analyse_songs() {
     let conn = &establish_connection();
 
     let to_analyse: Vec<(Song, SongData)> = {
-        use schema::tSong::{self, dsl::*};
-        use schema::tSongData::{self, dsl::*};
+        use schema::tSong::dsl::*;
+        use schema::tSongData::dsl::*;
         tSong
             .inner_join(tSongData)
             .filter(deleted.eq(false))
@@ -188,7 +189,7 @@ fn dl_meta() {
     println!("Identifying new songs");
     let client = make_client();
     let mut page = 0;
-    let mut new_maps: Vec<(BeatSaverMap, Vec<u8>)> = vec![];
+    let mut maps: Vec<(BeatSaverMap, Vec<u8>)> = vec![];
     loop {
         let res = get_latest_maps(&client, page).expect("failed to get latest maps");
 
@@ -197,12 +198,11 @@ fn dl_meta() {
         for (map, map_value) in res.docs {
             if get_db_song(conn, key_to_num(&map.key)).is_none() {
                 println!("Found a new map: {}", map.key);
-                num_new += 1;
-                new_maps.push((map, map_value.get().as_bytes().to_owned()))
+                num_new += 1
             } else {
                 println!("Map {} already in db", map.key);
-                continue
             }
+            maps.push((map, map_value.get().as_bytes().to_owned()))
         }
         println!("Got {} new maps", num_new);
         if num_new < num_maps / 2 {
@@ -210,38 +210,33 @@ fn dl_meta() {
             break
         }
         page += 1;
-        thread::sleep(time::Duration::from_secs(INFO_PAUSE_SECONDS));
+        thread::sleep(INFO_PAUSE);
     }
 
-    println!("Found {} new metas", new_maps.len());
-    while let Some((BeatSaverMap { key, hash }, raw_meta)) = new_maps.pop() {
+    println!("Upserting {} map metas", maps.len());
+    // Deliberately go oldest first, so if there's an error we can resume
+    while let Some((BeatSaverMap { key, hash }, raw_meta)) = maps.pop() {
         println!("Upserting {}", key);
         upsert_song(conn, key_to_num(&key), Some(hash), false, Some(raw_meta))
     }
 
-    //println!("Finding song metas to download");
-    //let (first_id, to_download): (String, Vec<String>) = {
-    //    use schema::tSong::dsl::*;
-    //    (
-    //        tSong.select(max(key)),
-    //        tSong
-    //            .select(key)
-    //            .filter(bsmeta.is_null())
-    //            .filter(deleted.eq(false))
-    //            .load::<String>(conn).expect("failed to select keys")
-    //    )
-    //};
-    //println!("Got {} to download", to_download.len());
-    //let to_download: BTreeSet<_> = to_download.into_iter().map(key_to_num).collect();
-    //while let Some(target) = to_download.pop_last() {
-
-    //    // loop
-    //    //   get a page
-    //    //     (handle everything)
-    //    //   if it included target, break
-    //    //   guess how far back/forward we need to go
-    //    //
-    //}
+    println!("Finding song metas to download");
+    let unknown = unknown_songs();
+    let num_unknown = unknown.len();
+    println!("Found {} unknown songs to download", num_unknown);
+    for (i, key) in unknown.into_iter().enumerate() {
+        println!("Getting meta for song {} ({}/{})", num_to_key(key), i+1, num_unknown);
+        match get_map(&client, key).expect("failed to get map for song") {
+            Some((m, raw)) => {
+                assert_eq!(key_to_num(&m.key), key);
+                upsert_song(conn, key, Some(m.hash), false, Some(raw.get().as_bytes().to_owned()))
+            },
+            None => {
+                upsert_song(conn, key, None, true, None)
+            },
+        }
+        thread::sleep(INFO_PAUSE)
+    }
 }
 
 fn dl_data() {
@@ -249,12 +244,12 @@ fn dl_data() {
 
     println!("Finding songs to download");
     let to_download: Vec<(Song, Option<SongData>)> = {
-        use schema::tSong::{self, dsl::*};
-        use schema::tSongData::{self, dsl::*};
+        use schema::tSong::dsl::*;
+        use schema::tSongData::dsl::*;
         tSong
             .left_join(tSongData)
-            .filter(tSong::hash.is_not_null())
-            .filter(tSongData::key.is_null())
+            .filter(schema::tSong::hash.is_not_null())
+            .filter(schema::tSongData::key.is_null())
             .filter(deleted.eq(false))
             .load(conn).expect("failed to select keys")
     };
@@ -264,6 +259,9 @@ fn dl_data() {
     to_download.reverse();
 
     fn load_blacklist() -> HashMap<String, String> {
+        if !Path::new("blacklist.json").is_file() {
+            fs::write("blacklist.json", b"{}").expect("failed to created empty blacklist file")
+        }
         serde_json::from_reader(fs::File::open("blacklist.json").expect("blacklist open failed")).expect("blacklist load failed")
     }
     fn save_blacklist(blacklist: &HashMap<String, String>) {
@@ -300,7 +298,7 @@ fn dl_data() {
         };
         set_song_data(conn, song.key, tardata, extra_meta, zipdata);
         println!("Finished getting song {}", song.key);
-        thread::sleep(time::Duration::from_secs(DL_PAUSE_SECONDS));
+        thread::sleep(DL_PAUSE);
     }
 }
 
@@ -330,54 +328,57 @@ struct BeatSaverMap {
     hash: String,
 }
 
-fn get_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Result<Vec<u8>> {
-    //let url = format!("https://beatsaver.com/cdn/{}/{}.zip", key, hash);
-    //println!("Retrieving {} from url {}", key, url);
+macro_rules! retry {
+    ($t:expr, $e:expr) => {{
+        println!("request failure: {}", $e);
+        thread::sleep($t);
+        continue
+    }};
+}
+
+const RATELIMIT_RESET_AFTER_HEADER: &str = "x-ratelimit-reset-after";
+
+fn get_song_zip(client: &reqwest::blocking::Client, key_str: &str, hash: &str) -> Result<Vec<u8>> {
+    //let url = format!("https://beatsaver.com/cdn/{}/{}.zip", key_str, hash);
+    //println!("Retrieving {} from url {}", key_str, url);
     //let mut res = client.get(&url).send().expect("failed to send request");
     //println!("Got response {}", res.status());
     //if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-    //    let url = format!("https://bsaber.org/files/cache/zip/{}.zip", key);
+    //    let url = format!("https://bsaber.org/files/cache/zip/{}.zip", key_str);
     //    println!("Retrying with url {}", url);
     //    res = client.get(&url).send().expect("failed to send request");
     //    println!("Got response {}", res.status());
     //}
 
     let mut attempts = 2;
-    macro_rules! retry {
-        ($e:expr) => {{
-            println!("request failure: {}", $e);
-            attempts -= 1;
-            if attempts == 0 {
-                panic!("failed to retrieve data")
-            }
-            thread::sleep(time::Duration::from_secs(DL_PAUSE_SECONDS));
-            continue
-        }};
-    }
     loop {
-        let url = format!("https://bsaber.org/files/cache/zip/{}.zip", key);
-        println!("Retrieving {} from {}", key, url);
-        let res = match client.get(&url).send() {
+        if attempts == 0 {
+            panic!("failed to retrieve data")
+        }
+        attempts -= 1;
+
+        println!("Retrieving {} from bsaber", key_str);
+        let (res, headers) = match do_req(client, &format!("https://bsaber.org/files/cache/zip/{}.zip", key_str)) {
             Ok(r) => r,
-            Err(e) => retry!(format!("failed to send request: {}", e)),
+            Err(e) => retry!(DL_PAUSE, format!("failed to send request: {}", e)),
         };
         println!("Got response {}", res.status());
 
-        let headers = res.headers().to_owned();
         if res.status() == reqwest::StatusCode::NOT_FOUND {
             bail!("song not found from bsaber.org")
         }
         if !res.status().is_success() {
-            retry!(format!("non-success response: {:?}", headers))
+            retry!(DL_PAUSE, format!("non-success response: {:?}", headers))
         }
         let bytes = match res.bytes() {
             Ok(bs) => bs,
-            Err(e) => retry!(format!("failed to get bytes: {}, response headers: {:?}", e, headers)),
+            Err(e) => retry!(DL_PAUSE, format!("failed to get bytes: {}, response headers: {:?}", e, headers)),
         };
+
         return Ok(bytes.as_ref().to_owned())
     }
 
-    //println!("Retrieving {} from fs", key);
+    //println!("Retrieving {} from fs", key_str);
     //let path = format!("../beatmaps/{}.zip", hash);
     //let zipdata = fs::read(path).unwrap();
     //zipdata
@@ -385,15 +386,9 @@ fn get_song_zip(client: &reqwest::blocking::Client, key: &str, hash: &str) -> Re
 
 fn get_latest_maps(client: &reqwest::blocking::Client, page: usize) -> Result<BeatSaverLatestResponse> {
     println!("Getting maps from page {}", page);
-
-    let url = format!("https://beatsaver.com/api/maps/latest/{}", page);
-    let res = match client.get(&url).send() {
-        Ok(r) => r,
-        Err(e) => bail!("failed to send request: {}", e),
-    };
+    let (res, headers) = do_req(client, &format!("https://beatsaver.com/api/maps/latest/{}", page))?;
     println!("Got response {}", res.status());
 
-    let headers = res.headers().to_owned();
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         bail!("latest maps page not found from beatsaver")
     }
@@ -404,10 +399,62 @@ fn get_latest_maps(client: &reqwest::blocking::Client, page: usize) -> Result<Be
         Ok(bs) => bs,
         Err(e) => bail!("failed to get bytes: {}, response headers: {:?}", e, headers),
     };
+
     let bytes = bytes.as_ref();
     let res = serde_json::from_slice(bytes)
         .with_context(|| format!("failed to deserialize maps response: {:?}", String::from_utf8_lossy(bytes)))?;
     Ok(res)
+}
+
+fn get_map(client: &reqwest::blocking::Client, key: i32) -> Result<Option<(BeatSaverMap, Box<serde_json::value::RawValue>)>> {
+    let mut did_ratelimit = false;
+
+    loop {
+        let key_str = num_to_key(key);
+        println!("Getting map detail for {}", key_str);
+        let (res, headers) = do_req(client, &format!("https://beatsaver.com/api/maps/detail/{}", key_str))?;
+        println!("Got response {}", res.status());
+
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None)
+        }
+        if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && !did_ratelimit {
+            did_ratelimit = true;
+            let pause = ratelimit_pause(&headers)?;
+            retry!(pause, format!("hit ratelimit, waiting {}s: {:?}", pause.as_secs(), headers))
+        }
+        if !res.status().is_success() {
+            bail!("non-success response: {:?}", headers)
+        }
+        let bytes = match res.bytes() {
+            Ok(bs) => bs,
+            Err(e) => bail!("failed to get bytes: {}, response headers: {:?}", e, headers),
+        };
+
+        let bytes = bytes.as_ref();
+        let raw_res: Box<serde_json::value::RawValue> = serde_json::from_slice(bytes)
+            .with_context(|| format!("failed to deserialize aw maps response: {:?}", String::from_utf8_lossy(bytes)))?;
+        let res = serde_json::from_str(raw_res.get())
+            .with_context(|| format!("failed to deserialize maps response: {:?}", String::from_utf8_lossy(bytes)))?;
+        return Ok(Some((res, raw_res)))
+    }
+}
+
+fn do_req(client: &reqwest::blocking::Client, url: &str) -> Result<(reqwest::blocking::Response, reqwest::header::HeaderMap)> {
+    client.get(url).send()
+        .map(|res| {
+            let headers = res.headers().to_owned();
+            (res, headers)
+        })
+        .context("failed to send request")
+}
+
+fn ratelimit_pause(headers: &reqwest::header::HeaderMap) -> Result<time::Duration> {
+    let r = headers.get(RATELIMIT_RESET_AFTER_HEADER)
+        .ok_or_else(|| anyhow!("no ratelimit header with too many requests response: {:?}", headers))?;
+    let r = r.to_str().with_context(|| format!("ratelimit header couldn't be interpreted as ascii: {:?}", headers))?;
+    let r: u64 = r.parse().with_context(|| format!("failed to parse ratelimit as i64: {:?}", headers))?;
+    Ok(time::Duration::from_millis(r + 1000)) // pad for safety
 }
 
 const IMAGE_EXTS: &[&str] = &[".jpg", ".jpeg", ".png"];
@@ -485,7 +532,7 @@ fn ogg_duration(ogg: &[u8]) -> Result<R32> {
 
 fn set_song_data(conn: &SqliteConnection, key: i32, data: Vec<u8>, extra_meta: ExtraMeta, zipdata: Vec<u8>) {
     let songdata = SongData { key, zipdata, data, extra_meta };
-    let nrows = diesel::insert_into(tSongData::table)
+    let nrows = diesel::insert_into(schema::tSongData::table)
         .values(&songdata)
         .execute(conn)
         .expect("error updating song data");
@@ -494,7 +541,7 @@ fn set_song_data(conn: &SqliteConnection, key: i32, data: Vec<u8>, extra_meta: E
 
 fn upsert_song(conn: &SqliteConnection, key: i32, hash: Option<String>, deleted: bool, bsmeta: Option<Vec<u8>>) {
     let new_song = Song { key, hash, tstamp: Utc::now().timestamp_millis(), deleted, bsmeta };
-    let nrows = diesel::replace_into(tSong::table)
+    let nrows = diesel::replace_into(schema::tSong::table)
         .values(&new_song)
         .execute(conn)
         .expect("error saving song");
@@ -503,7 +550,7 @@ fn upsert_song(conn: &SqliteConnection, key: i32, hash: Option<String>, deleted:
 
 fn insert_song(conn: &SqliteConnection, key: i32, hash: Option<String>, deleted: bool, bsmeta: Option<Vec<u8>>) {
     let new_song = Song { key, hash, tstamp: Utc::now().timestamp_millis(), deleted, bsmeta };
-    let nrows = diesel::insert_into(tSong::table)
+    let nrows = diesel::insert_into(schema::tSong::table)
         .values(&new_song)
         .execute(conn)
         .expect("error saving song");
