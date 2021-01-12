@@ -7,7 +7,9 @@ use std::path::Path;
 use std::io::BufReader;
 use std::thread;
 
+
 use super::INFO_PAUSE;
+use super::models::*;
 use super::schema;
 use super::{key_to_num, num_to_key};
 
@@ -28,6 +30,7 @@ struct RawPost {
     post_status: String,
 }
 
+/// Load JSON from a dump of the bsaber.com DB that I've manually munged
 pub fn loadjson() {
     let conn = super::establish_connection();
 
@@ -48,9 +51,10 @@ pub fn loadjson() {
 }
 
 
+/// Validate that every song marked as deleted, is in fact deleted
 pub fn checkdeleted() {
     let conn = &super::establish_connection();
-    let client = super::make_client();
+    let client = &super::make_client();
 
     fn load_deleteds() -> BTreeMap<String, bool> {
         if !Path::new("deleteds.json").is_file() {
@@ -62,6 +66,7 @@ pub fn checkdeleted() {
         serde_json::to_writer(fs::File::create("deleteds.json").expect("deleteds open failed"), &deleteds).expect("deleteds save failed")
     }
 
+    println!("Loading all deleted songs from db");
     let mut deleteds = load_deleteds();
     let currently_deleted: Vec<i32> = {
         use schema::tSong::dsl::*;
@@ -71,13 +76,14 @@ pub fn checkdeleted() {
             .load(conn).expect("failed to select keys")
     };
     let num_to_check = currently_deleted.len();
+    println!("Checking {} deleted songs", num_to_check);
     for (i, key) in currently_deleted.into_iter().enumerate() {
         let key_str = num_to_key(key);
         println!("Considering song {} ({}/{})", key_str, i+1, num_to_check);
         if deleteds.contains_key(&key_str) {
             continue
         }
-        let is_deleted = super::get_map(&client, key).expect("failed to get map detail").is_none();
+        let is_deleted = super::get_map(client, key).expect("failed to get map detail").is_none();
         assert!(deleteds.insert(key_str, is_deleted).is_none());
         save_deleteds(&deleteds);
 
@@ -88,4 +94,42 @@ pub fn checkdeleted() {
     let needs_undeleting_i32s: Vec<_> = needs_undeleting.iter().map(key_to_num).collect();
     println!("The following keys are marked as deleted but need undeleting: {:?}", needs_undeleting);
     println!("(as integers: {:?})", needs_undeleting_i32s);
+}
+
+/// For any song without a bsmeta and that isn't deleted, update it with one or the other
+pub fn getmissingbsmeta() {
+    let conn = &super::establish_connection();
+    let client = &super::make_client();
+
+    println!("Loading all songs with missing meta from DB");
+    let missing_meta: Vec<Song> = {
+        use schema::tSong::dsl::*;
+        tSong
+            .filter(deleted.eq(false))
+            .filter(bsmeta.is_null())
+            .load(conn).expect("failed to select keys")
+    };
+
+    let num_to_update = missing_meta.len();
+    println!("Updating {} songs with missing meta", num_to_update);
+    for (i, song) in missing_meta.into_iter().enumerate() {
+        let key_str = num_to_key(song.key);
+        println!("Considering song {} ({}/{})", key_str, i+1, num_to_update);
+
+        assert!(song.bsmeta.is_none());
+        match super::get_map(client, song.key).expect("failed to get map detail") {
+            Some((m, raw)) => {
+                assert_eq!(m.key, key_str);
+                if let Some(hash) = song.hash {
+                    assert_eq!(m.hash, hash);
+                }
+                super::upsert_song(conn, song.key, Some(m.hash), false, Some(raw.get().as_bytes().to_owned()))
+            },
+            None => {
+                super::upsert_song(conn, song.key, song.hash, true, song.bsmeta)
+            },
+        }
+
+        thread::sleep(INFO_PAUSE)
+    }
 }

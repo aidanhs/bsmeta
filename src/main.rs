@@ -107,6 +107,7 @@ fn main() {
     match args[1].as_str() {
         "script-loadjson" => scripts::loadjson(),
         "script-checkdeleted" => scripts::checkdeleted(),
+        "script-getmissingbsmeta" => scripts::getmissingbsmeta(),
         "unknown" => {
             println!("Considering unknown keys");
             println!("Unknown keys: {:?}", unknown_songs().len());
@@ -238,10 +239,11 @@ fn dl_unknown_meta(conn: &SqliteConnection, client: &reqwest::blocking::Client) 
     let num_unknown = unknown.len();
     println!("Found {} unknown songs to download", num_unknown);
     for (i, key) in unknown.into_iter().enumerate() {
-        println!("Getting meta for song {} ({}/{})", num_to_key(key), i+1, num_unknown);
+        let key_str = num_to_key(key);
+        println!("Getting meta for song {} ({}/{})", key_str, i+1, num_unknown);
         match get_map(client, key).expect("failed to get map for song") {
             Some((m, raw)) => {
-                assert_eq!(key_to_num(&m.key), key);
+                assert_eq!(m.key, key_str);
                 upsert_song(conn, key, Some(m.hash), false, Some(raw.get().as_bytes().to_owned()))
             },
             None => {
