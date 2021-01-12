@@ -185,13 +185,19 @@ fn make_client() -> reqwest::blocking::Client {
 
 fn dl_meta() {
     let conn = &establish_connection();
+    let client = &make_client();
 
+    dl_latest_meta(conn, client);
+
+    dl_unknown_meta(conn, client);
+}
+
+fn dl_latest_meta(conn: &SqliteConnection, client: &reqwest::blocking::Client) {
     println!("Identifying new songs");
-    let client = make_client();
     let mut page = 0;
     let mut maps: Vec<(BeatSaverMap, Vec<u8>)> = vec![];
     loop {
-        let res = get_latest_maps(&client, page).expect("failed to get latest maps");
+        let res = get_latest_maps(client, page).expect("failed to get latest maps");
 
         let mut num_new = 0;
         let num_maps = res.docs.len();
@@ -219,14 +225,16 @@ fn dl_meta() {
         println!("Upserting {}", key);
         upsert_song(conn, key_to_num(&key), Some(hash), false, Some(raw_meta))
     }
+}
 
+fn dl_unknown_meta(conn: &SqliteConnection, client: &reqwest::blocking::Client) {
     println!("Finding song metas to download");
     let unknown = unknown_songs();
     let num_unknown = unknown.len();
     println!("Found {} unknown songs to download", num_unknown);
     for (i, key) in unknown.into_iter().enumerate() {
         println!("Getting meta for song {} ({}/{})", num_to_key(key), i+1, num_unknown);
-        match get_map(&client, key).expect("failed to get map for song") {
+        match get_map(client, key).expect("failed to get map for song") {
             Some((m, raw)) => {
                 assert_eq!(key_to_num(&m.key), key);
                 upsert_song(conn, key, Some(m.hash), false, Some(raw.get().as_bytes().to_owned()))
@@ -269,7 +277,7 @@ fn dl_data() {
     }
 
     let mut blacklisted_keys = load_blacklist();
-    let client = make_client();
+    let client = &make_client();
     for song in to_download {
         let key_str = num_to_key(song.key);
         let hash = song.hash.expect("non-null hash was None");
@@ -279,7 +287,7 @@ fn dl_data() {
         }
         println!("Considering song {}", song.key);
         println!("Getting song zip for {} {}", song.key, hash);
-        let zipdata = match get_song_zip(&client, &key_str, &hash) {
+        let zipdata = match get_song_zip(client, &key_str, &hash) {
             Ok(zd) => zd,
             Err(e) => {
                 blacklisted_keys.insert(key_str.clone(), format!("get song zip failed: {}", e));
