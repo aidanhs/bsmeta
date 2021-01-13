@@ -386,7 +386,7 @@ fn get_song_zip(client: &reqwest::blocking::Client, key_str: &str, hash: &str) -
             bail!("song not found from bsaber.org")
         }
         if !res.status().is_success() {
-            retry!(DL_PAUSE, format!("non-success response: {:?}", headers))
+            retry!(DL_PAUSE, format!("non-success response: {:?} {:?}", headers, res.bytes()))
         }
         let bytes = match res.bytes() {
             Ok(bs) => bs,
@@ -411,7 +411,7 @@ fn get_latest_maps(client: &reqwest::blocking::Client, page: usize) -> Result<Be
         bail!("latest maps page not found from beatsaver")
     }
     if !res.status().is_success() {
-        bail!("non-success response: {:?}", headers)
+        bail!("non-success response: {:?} {:?}", headers, res.bytes())
     }
     let bytes = match res.bytes() {
         Ok(bs) => bs,
@@ -442,7 +442,7 @@ fn get_map(client: &reqwest::blocking::Client, key: i32) -> Result<Option<(BeatS
             retry!(pause, format!("hit ratelimit, waiting {}s: {:?}", pause.as_secs(), headers))
         }
         if !res.status().is_success() {
-            bail!("non-success response: {:?}", headers)
+            bail!("non-success response: {:?} {:?}", headers, res.bytes())
         }
         let bytes = match res.bytes() {
             Ok(bs) => bs,
