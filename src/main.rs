@@ -209,15 +209,26 @@ fn test() -> Result<()> {
     // Steal these from wasi for minimal consistency
     use std::cell::Cell;
     use std::sync::Arc;
+    use wasmer_wasi::ALL_RIGHTS;
     use wasmer_wasi::types::{
         __wasi_ciovec_t,
+        __wasi_errno_t,
+        __wasi_fdstat_t,
         __wasi_prestat_t,
+        __wasi_prestat_u,
+        __wasi_prestat_u_dir_t,
+        __wasi_fd_t,
+
+        __WASI_FILETYPE_DIRECTORY,
+
+        __WASI_PREOPENTYPE_DIR,
 
         __WASI_ESUCCESS,
         __WASI_EINVAL,
         __WASI_EFAULT,
         __WASI_EBADF,
         __WASI_EIO,
+
         __WASI_STDIN_FILENO,
         __WASI_STDOUT_FILENO,
         __WASI_STDERR_FILENO,
@@ -263,6 +274,7 @@ fn test() -> Result<()> {
     let script_len: u32 = script.len().try_into().expect("script too big");
     let script_env = ScriptEnv { script, script_len, memory: Default::default() };
 
+    const WORKDIR: &[u8] = b"/work";
     let overrides = vec![
         (
             ("env", "get_script_size"),
@@ -272,15 +284,35 @@ fn test() -> Result<()> {
             ("env", "get_script_data"),
             Function::new_native_with_env(&store, script_env, move |env: &ScriptEnv, data: WasmPtr<u8, Array>| -> () {
                 let memory = env.memory_ref().expect("memory not set up");
-                let data_cell = mytry!(data.deref(memory, 0, env.script_len).ok_or(()));
-                for (cell, &b) in data_cell.into_iter().zip(env.script.iter()) {
+                let data = mytry!(data.deref(memory, 0, env.script_len).ok_or(()));
+                for (cell, &b) in data.into_iter().zip(env.script.iter()) {
                     cell.set(b)
                 }
             }).to_export(),
         ),
         (
+            ("wasi_snapshot_preview1", "args_get"),
+            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, argv: WasmPtr<WasmPtr<u8, Array>, Array>, argv_buf: WasmPtr<u8, Array>| -> __wasi_errno_t {
+                println!("wasi-ish>> args_get");
+                __WASI_ESUCCESS
+            }).to_export(),
+        ),
+        (
+            ("wasi_snapshot_preview1", "args_sizes_get"),
+            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, argc: WasmPtr<u32>, argv_buf_size: WasmPtr<u32>| -> __wasi_errno_t {
+                println!("wasi-ish>> args_sizes_get");
+                let memory = env.memory_ref().expect("memory not set up");
+                let argc = mytry!(argc.deref(memory).ok_or(__WASI_EFAULT));
+                let argv_buf_size = mytry!(argv_buf_size.deref(memory).ok_or(__WASI_EFAULT));
+                argc.set(0);
+                argv_buf_size.set(0);
+                __WASI_ESUCCESS
+            }).to_export(),
+        ),
+        (
             ("wasi_snapshot_preview1", "clock_time_get"),
-            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, _clock_id: u32, _precision: u64, time: WasmPtr<u64>| -> u16 {
+            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, _clock_id: u32, _precision: u64, time: WasmPtr<u64>| -> __wasi_errno_t {
+                println!("wasi-ish>> clock_time_get");
                 let memory = env.memory_ref().expect("memory not set up");
                 let out_addr = mytry!(time.deref(memory).ok_or(__WASI_EFAULT));
                 out_addr.set(0);
@@ -289,7 +321,8 @@ fn test() -> Result<()> {
         ),
         (
             ("wasi_snapshot_preview1", "environ_sizes_get"),
-            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, environ_count: WasmPtr<u32>, environ_buf_size: WasmPtr<u32>| -> u16 {
+            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, environ_count: WasmPtr<u32>, environ_buf_size: WasmPtr<u32>| -> __wasi_errno_t {
+                println!("wasi-ish>> environ_sizes_get");
                 let memory = env.memory_ref().expect("memory not set up");
                 let environ_count = mytry!(environ_count.deref(memory).ok_or(__WASI_EFAULT));
                 let environ_buf_size = mytry!(environ_buf_size.deref(memory).ok_or(__WASI_EFAULT));
@@ -299,26 +332,102 @@ fn test() -> Result<()> {
             }).to_export(),
         ),
         (
-            ("wasi_snapshot_preview1", "fd_prestat_get"),
-            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, fd: u32, prestat: WasmPtr<__wasi_prestat_t>| -> u16 {
+            ("wasi_snapshot_preview1", "fd_write"),
+            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, fd: __wasi_fd_t, iovs: WasmPtr<__wasi_ciovec_t, Array>, iovs_len: u32, nwritten: WasmPtr<u32>| -> __wasi_errno_t {
+                println!("wasi-ish>> fd_write {}", fd);
                 let memory = env.memory_ref().expect("memory not set up");
-                let prestat_cell = mytry!(prestat.deref(memory).ok_or(__WASI_EFAULT));
-                __WASI_EBADF
-                //__WASI_ESUCCESS
+                let iovs = mytry!(iovs.deref(memory, 0, iovs_len).ok_or(__WASI_EFAULT));
+                let nwritten = mytry!(nwritten.deref(memory).ok_or(__WASI_EFAULT));
+                let count = mytry!(match fd {
+                    __WASI_STDOUT_FILENO => write_bytes(io::stdout().lock(), &memory, iovs),
+                    __WASI_STDERR_FILENO => write_bytes(io::stderr().lock(), &memory, iovs),
+                    _ => return __WASI_EINVAL,
+                });
+                nwritten.set(count);
+                __WASI_ESUCCESS
             }).to_export(),
         ),
         (
-            ("wasi_snapshot_preview1", "fd_write"),
-            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, fd: u32, iovs: WasmPtr<__wasi_ciovec_t, Array>, iovs_len: u32, nwritten: WasmPtr<u32>| -> u16 {
-                let memory = env.memory_ref().expect("memory not set up");
-                let iovs_arr_cell = mytry!(iovs.deref(memory, 0, iovs_len).ok_or(__WASI_EFAULT));
-                let nwritten_cell = mytry!(nwritten.deref(memory).ok_or(__WASI_EFAULT));
-                let nwritten = mytry!(match fd {
-                    __WASI_STDOUT_FILENO => write_bytes(io::stdout().lock(), &memory, iovs_arr_cell),
-                    __WASI_STDERR_FILENO => write_bytes(io::stderr().lock(), &memory, iovs_arr_cell),
-                    _ => return __WASI_EINVAL,
-                });
-                nwritten_cell.set(nwritten);
+            ("wasi_snapshot_preview1", "fd_fdstat_get"),
+            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, fd: __wasi_fd_t, fdstat: WasmPtr<__wasi_fdstat_t>| -> __wasi_errno_t {
+                println!("wasi-ish>> fd_fdstat_get {}", fd);
+                match fd {
+                    3 => {
+                        let memory = env.memory_ref().expect("memory not set up");
+                        let fdstat = mytry!(fdstat.deref(memory).ok_or(__WASI_EFAULT));
+                        fdstat.set(__wasi_fdstat_t {
+                            fs_filetype: __WASI_FILETYPE_DIRECTORY,
+                            fs_flags: 0,
+                            fs_rights_base: ALL_RIGHTS,
+                            fs_rights_inheriting: ALL_RIGHTS,
+                        });
+                    },
+                    _ => return __WASI_EBADF,
+                }
+                __WASI_ESUCCESS
+            }).to_export(),
+        ),
+        // Path and preopen handling
+        // https://github.com/WebAssembly/wasi-libc/blob/5b148b6131f36770f110c24d61adfb1e17fea06a/libc-bottom-half/sources/preopens.c#L201
+        (
+            ("wasi_snapshot_preview1", "fd_prestat_dir_name"),
+            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, fd: __wasi_fd_t, path: WasmPtr<u8, Array>, path_len: u32| -> __wasi_errno_t {
+                println!("wasi-ish>> fd_prestat_dir_name {}", fd);
+                match fd {
+                    3 => {
+                        assert_eq!(path_len as usize, WORKDIR.len());
+                        let memory = env.memory_ref().expect("memory not set up");
+                        let path = mytry!(path.deref(memory, 0, path_len).ok_or(__WASI_EFAULT));
+                        for (cell, &b) in path.into_iter().zip(WORKDIR.iter()) {
+                            cell.set(b)
+                        }
+                    },
+                    _ => return __WASI_EBADF,
+                }
+                __WASI_ESUCCESS
+            }).to_export(),
+        ),
+        (
+            ("wasi_snapshot_preview1", "fd_prestat_get"),
+            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, fd: __wasi_fd_t, prestat: WasmPtr<__wasi_prestat_t>| -> __wasi_errno_t {
+                println!("wasi-ish>> fd_prestat_get {}", fd);
+                match fd {
+                    3 => {
+                        let memory = env.memory_ref().expect("memory not set up");
+                        let prestat = mytry!(prestat.deref(memory).ok_or(__WASI_EFAULT));
+                        prestat.set(__wasi_prestat_t {
+                            pr_type: __WASI_PREOPENTYPE_DIR,
+                            u: __wasi_prestat_u {
+                                dir: __wasi_prestat_u_dir_t {
+                                    pr_name_len: WORKDIR.len().try_into().expect("workdir too long"),
+                                },
+                            },
+                        })
+                    },
+                    _ => return __WASI_EBADF,
+                }
+                __WASI_ESUCCESS
+            }).to_export(),
+        ),
+        (
+            ("wasi_snapshot_preview1", "fd_prestat_get"),
+            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, fd: __wasi_fd_t, prestat: WasmPtr<__wasi_prestat_t>| -> __wasi_errno_t {
+                println!("wasi-ish>> fd_prestat_get {}", fd);
+                match fd {
+                    3 => {
+                        let memory = env.memory_ref().expect("memory not set up");
+                        let prestat = mytry!(prestat.deref(memory).ok_or(__WASI_EFAULT));
+                        prestat.set(__wasi_prestat_t {
+                            pr_type: __WASI_PREOPENTYPE_DIR,
+                            u: __wasi_prestat_u {
+                                dir: __wasi_prestat_u_dir_t {
+                                    pr_name_len: WORKDIR.len().try_into().expect("workdir too long"),
+                                },
+                            },
+                        })
+                    },
+                    _ => return __WASI_EBADF,
+                }
                 __WASI_ESUCCESS
             }).to_export(),
         ),
@@ -365,19 +474,21 @@ fn test() -> Result<()> {
     println!("running: _start");
     let f = instance.exports.get_function("_start")?;
     match f.call(&[]) {
-        Ok(vals) => println!("{:?}", vals),
+        Ok(vals) => println!("success: {:?}", vals),
         Err(re) => {
-            println!("{}", re);
+            println!("fail: {}", re);
             println!("trace: {:#?}", re.trace());
+            bail!("oh no")
         }
     }
     println!("running: do_analysis");
     let f = instance.exports.get_function("do_analysis")?;
     match f.call(&[]) {
-        Ok(vals) => println!("{:?}", vals),
+        Ok(vals) => println!("success: {:?}", vals),
         Err(re) => {
-            println!("{}", re);
+            println!("fail: {}", re);
             println!("trace: {:#?}", re.trace());
+            bail!("oh no")
         }
     }
     Ok(())
