@@ -163,6 +163,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "typetag",
  "wasmer",
  "wasmer-wasi",
  "zip",
