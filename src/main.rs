@@ -103,6 +103,7 @@ const DL_PAUSE: time::Duration = time::Duration::from_secs(10);
 const RATELIMIT_PADDING: time::Duration = time::Duration::from_secs(5);
 
 fn main() {
+    env_logger::init();
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         panic!("wrong num of args")
@@ -118,6 +119,7 @@ fn main() {
         "dl" => dl_data(),
         "dlmeta" => dl_meta(),
         "analyse" => analyse_songs(),
+        "test" => test().unwrap(),
         a => panic!("unknown arg {}", a),
     }
 }
@@ -129,6 +131,256 @@ fn key_to_num<T: AsRef<str>>(k: &T) -> i32 {
 fn num_to_key(n: i32) -> String {
     assert!(n >= 0);
     format!("{:x}", n)
+}
+
+fn test() -> Result<()> {
+    println!("doing wasm things");
+    use wasmer::{Array, WasmPtr, ValueType, LazyInit, Memory, Store, WasmerEnv, LikeNamespace, Cranelift, JIT, Exports, Export, Exportable, Val, ExternType, Function, ImportType, Resolver, Module, Instance, Value, imports, RuntimeError};
+    use wasmer_wasi::{WasiState, WasiEnv, WasiVersion};
+
+    //let module_bytes = fs::read("quickjs/qjs.wasm")?;
+    let module_bytes = fs::read("out.wasm")?;
+
+    // TODO: wasmer/examples/tunables_limit_memory.rs
+    let mut cranelift = Cranelift::new();
+    cranelift.enable_simd(false);
+    let engine = JIT::new(cranelift).engine();
+    let store = Store::new(&engine);
+    let module = Module::from_binary(&store, &module_bytes)?;
+    println!("{:?}", module);
+    println!("imports:");
+    for import in module.imports() {
+        println!("{:?}", import)
+    }
+    println!("exports:");
+    for export in module.exports() {
+        println!("{:?}", export)
+    }
+
+    struct FakeResolver {
+        exports: Vec<Export>,
+    }
+    impl FakeResolver {
+        fn new(store: &Store, imports: impl Iterator<Item=ImportType>, overrides: &HashMap<(&str, &str), Export>) -> Self {
+            let exports = imports.map(|import| {
+                let path = format!("{}:{}", import.module(), import.name());
+                if let Some(ex) = overrides.get(&(import.module(), import.name())) {
+                    println!("using override for {}", path);
+                    return ex.clone()
+                }
+                println!("shimming import {:?}", import);
+                let ty: &ExternType = import.ty();
+                match ty {
+                    ExternType::Function(ft) => {
+                        let errfn = move |_vals: &[Val]| -> Result<Vec<Val>, RuntimeError> {
+                            Err(RuntimeError::new(path.clone()))
+                        };
+                        let f = Function::new(store, ft, errfn);
+                        f.to_export()
+                    },
+                    other => {
+                        todo!("unable to shim {:?}", other)
+                    },
+                }
+            }).collect();
+            Self { exports }
+        }
+    }
+    impl Resolver for FakeResolver {
+        fn resolve(&self, index: u32, _module: &str, _field: &str) -> Option<Export> {
+            Some(self.exports[index as usize].clone())
+        }
+    }
+
+    #[derive(Default, Clone, WasmerEnv)]
+    struct MyEnv {
+        #[wasmer(export)]
+        memory: LazyInit<Memory>,
+    }
+    #[derive(Clone, WasmerEnv)]
+    struct ScriptEnv {
+        script: Vec<u8>,
+        script_len: u32,
+        #[wasmer(export)]
+        memory: LazyInit<Memory>,
+    }
+
+
+    // Steal these from wasi for minimal consistency
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use wasmer_wasi::types::{
+        __wasi_ciovec_t,
+        __wasi_prestat_t,
+
+        __WASI_ESUCCESS,
+        __WASI_EINVAL,
+        __WASI_EFAULT,
+        __WASI_EBADF,
+        __WASI_EIO,
+        __WASI_STDIN_FILENO,
+        __WASI_STDOUT_FILENO,
+        __WASI_STDERR_FILENO,
+    };
+    fn write_bytes_inner<T: io::Write>(
+        mut write_loc: T,
+        memory: &Memory,
+        iovs_arr_cell: &[Cell<__wasi_ciovec_t>],
+    ) -> Result<u32, u16> {
+        let mut bytes_written = 0;
+        for iov in iovs_arr_cell {
+            let iov_inner = iov.get();
+            let bytes = iov_inner.buf.deref(memory, 0, iov_inner.buf_len)?;
+            write_loc
+                .write_all(&bytes.iter().map(|b_cell| b_cell.get()).collect::<Vec<u8>>())
+                .map_err(|_| __WASI_EIO)?;
+
+            // TODO: handle failure more accurately
+            bytes_written += iov_inner.buf_len;
+        }
+        Ok(bytes_written)
+    }
+    fn write_bytes<T: io::Write>(
+        mut write_loc: T,
+        memory: &Memory,
+        iovs_arr_cell: &[Cell<__wasi_ciovec_t>],
+    ) -> Result<u32, u16> {
+        // TODO: limit amount written
+        let result = write_bytes_inner(&mut write_loc, memory, iovs_arr_cell);
+        write_loc.flush();
+        result
+    }
+    macro_rules! mytry {
+        ($e:expr) => {{
+            match $e {
+                Ok(v) => v,
+                Err(e) => return e,
+            }
+        }};
+    }
+
+    let script = fs::read("plugintest.js").expect("failed to open plugin");
+    let script_len: u32 = script.len().try_into().expect("script too big");
+    let script_env = ScriptEnv { script, script_len, memory: Default::default() };
+
+    let overrides = vec![
+        (
+            ("env", "get_script_size"),
+            Function::new_native_with_env(&store, script_len, move |&script_len_env: &u32| -> u32 { script_len_env }).to_export(),
+        ),
+        (
+            ("env", "get_script_data"),
+            Function::new_native_with_env(&store, script_env, move |env: &ScriptEnv, data: WasmPtr<u8, Array>| -> () {
+                let memory = env.memory_ref().expect("memory not set up");
+                let data_cell = mytry!(data.deref(memory, 0, env.script_len).ok_or(()));
+                for (cell, &b) in data_cell.into_iter().zip(env.script.iter()) {
+                    cell.set(b)
+                }
+            }).to_export(),
+        ),
+        (
+            ("wasi_snapshot_preview1", "clock_time_get"),
+            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, _clock_id: u32, _precision: u64, time: WasmPtr<u64>| -> u16 {
+                let memory = env.memory_ref().expect("memory not set up");
+                let out_addr = mytry!(time.deref(memory).ok_or(__WASI_EFAULT));
+                out_addr.set(0);
+                __WASI_ESUCCESS
+            }).to_export(),
+        ),
+        (
+            ("wasi_snapshot_preview1", "environ_sizes_get"),
+            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, environ_count: WasmPtr<u32>, environ_buf_size: WasmPtr<u32>| -> u16 {
+                let memory = env.memory_ref().expect("memory not set up");
+                let environ_count = mytry!(environ_count.deref(memory).ok_or(__WASI_EFAULT));
+                let environ_buf_size = mytry!(environ_buf_size.deref(memory).ok_or(__WASI_EFAULT));
+                environ_count.set(0);
+                environ_buf_size.set(0);
+                __WASI_ESUCCESS
+            }).to_export(),
+        ),
+        (
+            ("wasi_snapshot_preview1", "fd_prestat_get"),
+            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, fd: u32, prestat: WasmPtr<__wasi_prestat_t>| -> u16 {
+                let memory = env.memory_ref().expect("memory not set up");
+                let prestat_cell = mytry!(prestat.deref(memory).ok_or(__WASI_EFAULT));
+                __WASI_EBADF
+                //__WASI_ESUCCESS
+            }).to_export(),
+        ),
+        (
+            ("wasi_snapshot_preview1", "fd_write"),
+            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, fd: u32, iovs: WasmPtr<__wasi_ciovec_t, Array>, iovs_len: u32, nwritten: WasmPtr<u32>| -> u16 {
+                let memory = env.memory_ref().expect("memory not set up");
+                let iovs_arr_cell = mytry!(iovs.deref(memory, 0, iovs_len).ok_or(__WASI_EFAULT));
+                let nwritten_cell = mytry!(nwritten.deref(memory).ok_or(__WASI_EFAULT));
+                let nwritten = mytry!(match fd {
+                    __WASI_STDOUT_FILENO => write_bytes(io::stdout().lock(), &memory, iovs_arr_cell),
+                    __WASI_STDERR_FILENO => write_bytes(io::stderr().lock(), &memory, iovs_arr_cell),
+                    _ => return __WASI_EINVAL,
+                });
+                nwritten_cell.set(nwritten);
+                __WASI_ESUCCESS
+            }).to_export(),
+        ),
+    ].into_iter().collect();
+    let importobj = FakeResolver::new(&store, module.imports(), &overrides);
+
+    //let fake_namespace: Exports = module.imports()
+    //    .filter(|import| import.module() == "env")
+    //    .map(|import| {
+    //        let ty: &ExternType = import.ty();
+    //        let ex = match ty {
+    //            ExternType::Function(ft) => {
+    //                let path = format!("{}:{}", import.module(), import.name());
+    //                let errfn = move |_vals: &[Val]| -> Result<Vec<Val>, RuntimeError> {
+    //                    Err(RuntimeError::new(path.clone()))
+    //                };
+    //                let f = Function::new(&store, ft, errfn);
+    //                f.into()
+    //            },
+    //            other => {
+    //                todo!("unable to shim {:?}", other)
+    //            },
+    //        };
+    //        (import.name().to_owned(), ex)
+    //    })
+    //    .collect();
+
+    //let wasi_state = WasiState::new("testy")
+    //    .args(&["--std", "--script", "/plugintest.js"])
+    //    .preopen_dir("/tmp")?
+    //    //.preopen_dir("/home/aidanhs/Desktop/per/bsaber/bsmeta")?
+    //    .build()?;
+    //let wasi_env = WasiEnv::new(wasi_state);
+    //let wasi_vsn = wasmer_wasi::get_wasi_version(&module, false).unwrap();
+    //let mut importobj = wasmer_wasi::generate_import_object_from_env(&store, wasi_env, wasi_vsn);
+    //println!("wasi generated importobj");
+    //for (path, _export) in importobj.clone() {
+    //    println!("{:?}", path)
+    //}
+    //importobj.register("env", fake_namespace);
+
+    let instance = Instance::new(&module, &importobj)?;
+
+    println!("running: _start");
+    let f = instance.exports.get_function("_start")?;
+    match f.call(&[]) {
+        Ok(vals) => println!("{:?}", vals),
+        Err(re) => {
+            println!("{}", re);
+            println!("trace: {:#?}", re.trace());
+        }
+    }
+    println!("running: do_analysis");
+    let f = instance.exports.get_function("do_analysis")?;
+    match f.call(&[]) {
+        Ok(vals) => println!("{:?}", vals),
+        Err(re) => {
+            println!("{}", re);
+            println!("trace: {:#?}", re.trace());
+        }
+    }
+    Ok(())
 }
 
 fn unknown_songs() -> Vec<i32> {
