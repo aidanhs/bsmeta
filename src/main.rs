@@ -236,6 +236,9 @@ fn dl_latest_meta(conn: &SqliteConnection, client: &reqwest::blocking::Client) {
     }
 }
 
+// These are keys that beatsaver seems to redirect to another map - I'm not sure why
+const REDIRECTING_KEYS: &[i32] = &[0x9707];
+
 fn dl_unknown_meta(conn: &SqliteConnection, client: &reqwest::blocking::Client) {
     println!("Finding song metas to download");
     let unknown = unknown_songs();
@@ -243,6 +246,10 @@ fn dl_unknown_meta(conn: &SqliteConnection, client: &reqwest::blocking::Client) 
     println!("Found {} unknown songs to download", num_unknown);
     for (i, key) in unknown.into_iter().enumerate() {
         let key_str = num_to_key(key);
+        if REDIRECTING_KEYS.iter().find(|&&k| k == key).is_some() {
+            println!("Skipping key {}", key_str);
+            continue
+        }
         println!("Getting meta for song {} ({}/{})", key_str, i+1, num_unknown);
         match get_map(client, key).expect("failed to get map for song") {
             Some((m, raw)) => {
