@@ -3,11 +3,6 @@
 #include "quickjs/quickjs-libc.h"
 #include "quickjs/quickjs.h"
 
-int main(int argc, char **argv) {
-    setbuf(stdout, NULL);
-    setbuf(stderr, NULL);
-}
-
 // Stolen from qjs.c
 static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
                     const char *filename, int eval_flags)
@@ -37,7 +32,7 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
     return ret;
 }
 
-uint8_t do_analysis() {
+int run_script() {
     JSRuntime *rt;
     JSContext *ctx;
 
@@ -62,7 +57,6 @@ uint8_t do_analysis() {
         "import * as os from 'os';\n"
         "globalThis.std = std;\n"
         "globalThis.os = os;\n";
-    int base_len = strlen(base);
 
     ret = eval_buf(ctx, base, strlen(base), "<input>", JS_EVAL_TYPE_MODULE);
     if (ret != 0) { return ret; }
@@ -72,7 +66,7 @@ uint8_t do_analysis() {
     uint8_t *buf = js_load_file(ctx, &buf_len, filename);
     if (!buf) {
         perror(filename);
-        exit(1);
+        return 1;
     }
 
     ret = eval_buf(ctx, buf, buf_len, "<input>", JS_EVAL_TYPE_MODULE);
@@ -81,4 +75,12 @@ uint8_t do_analysis() {
     if (ret != 0) { return ret; }
 
     return 0;
+}
+
+int main(int argc, char **argv) {
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+    return run_script();
+    // TODO, or figure how to get return val from main
+    //exit(run_script());
 }

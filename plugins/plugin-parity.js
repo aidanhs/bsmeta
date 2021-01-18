@@ -3,10 +3,6 @@ import * as os from 'os';
 globalThis.std = std;
 globalThis.os = os;
 
-console.log('hmm');
-console.log(os.readdir('/'));
-console.log('hmm2');
-
 function noop() {}
 
 function getScrollLineHeight() {
@@ -36,7 +32,6 @@ globalThis.window = {
     parseInt: noop,
 };
 
-//std.loadScript("/work/bs-parity/scripts/main.js");
 std.loadScript("/work/bs-parity-main.js");
 // Post-load overrides
 var TOTAL_OUTPUT = [];
@@ -46,8 +41,7 @@ outputUI = function (note, parity, message, messageType, persistent = false) {
 clearOutput = noop;
 
 // Prep globals
-//let parsed = JSON.parse(std.loadFile("../beatmaps/7f0356d54ded74ed2dbf56e7290a29fde002c0af/ExpertPlusStandard.dat"));
-let parsed = JSON.parse(std.loadFile("/work/7f0356d54ded74ed2dbf56e7290a29fde002c0af-ExpertPlusStandard.dat"));
+let parsed = JSON.parse(std.loadFile("/data/map.dat"));
 notesArray = getNotes(parsed);
 wallsArray = getWalls(parsed);
 ready = true;
@@ -56,5 +50,4 @@ ready = true;
 checkParity();
 
 // Return
-console.log(JSON.stringify(TOTAL_OUTPUT));
-console.log(JSON.stringify(SUMMARY.textContent));
+console.log(JSON.stringify({summary: SUMMARY, detail: TOTAL_OUTPUT}));

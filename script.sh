@@ -22,31 +22,46 @@ elif [ "$1" = run ]; then
     RUST_BACKTRACE=1 WASI_ROOT=$(pwd)/wasmtime/crates/wasi-common/WASI cargo run --release -- "$@"
     #RUST_BACKTRACE=1 WASI_ROOT=$(pwd)/wasmtime/crates/wasi-common/WASI cargo flamegraph -- "$@"
 
-elif [ "$1" = buildplugins ]; then
-    cd quickjs
+elif [ "$1" = plugins ]; then
+    shift
 
-    ## Native
-    #make clean
-    #make -j8
+    arg=
+    if [ "$#" -ge 1 ]; then
+        arg="$1"
+        shift
+    fi
+    if [ "$arg" = build-interps ]; then
+        cd plugins
+        mkdir -p dist
 
-    ## Emscripten
-    #EMFLAGS="-s STANDALONE_WASM=1 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -s EXPORTED_FUNCTIONS=[\"_do_analysis\"]"
-    #make clean
-    #make -j8 CONFIG_DEFAULT_AR=y CROSS_PREFIX=em CC="emcc $EMFLAGS" CONFIG_CLANG=y
+        # JS
+        cd quickjs
+        git reset --hard
+        git clean -fxd
+        git apply < ../quickjs.patch
+        # https://github.com/WebAssembly/wasi-libc/issues/85 - WASM has limited rounding modes,
+        # we just define them arbitrarily and accept that rounding will be wrong ¯\_(ツ)_/¯
+        make libquickjs.a \
+            CONFIG_DEFAULT_AR=y CONFIG_CLANG=y \
+            CROSS_PREFIX=wasi CC="wasicc -DEMSCRIPTEN -DFE_DOWNWARD=100 -DFE_UPWARD=101"
+        cd ..
+        wasicc -Wl,--allow-undefined -Wall -O2 -o dist/js.wasm interp-js.c quickjs/libquickjs.a
 
-    ## wasienv
-    #make clean
-    ## https://github.com/WebAssembly/wasi-libc/issues/85 - WASM has limited rounding modes, we just define them arbitrarily
-    ## and accept that rounding will be wrong ¯\_(ツ)_/¯
-    #make -j8 libquickjs.a \
-    #    CONFIG_DEFAULT_AR=y CONFIG_CLANG=y \
-    #    CROSS_PREFIX=wasi CC="wasicc -DEMSCRIPTEN -DFE_DOWNWARD=100 -DFE_UPWARD=101"
+    elif [ "$arg" = build-plugins ]; then
+        cd plugins
+        mkdir -p dist
 
-    cd ..
+        ./genplugins.py
 
-    #gcc -O2 -Wall -lm myeval.c quickjs/libquickjs.a
-    #emcc --no-entry $EMFLAGS -O2 -o out.wasm myeval.c quickjs/libquickjs.a
-    wasicc -Wl,--allow-undefined -Wl,--export=do_analysis -O2 -o out.wasm myeval.c quickjs/libquickjs.a
+    elif [ "$arg" = rebuild ]; then
+        rm -rf plugins/dist
+        ./script.sh plugins build-interps
+        ./script.sh plugins build-plugins
+
+    else
+        echo "unknown plugins subcommand"
+        exit 1
+    fi
 
 else
     echo invalid command

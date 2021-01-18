@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs;
 use std::io::{self, Seek, Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -990,9 +991,8 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
     }
 }
 
-fn load_module() -> Result<wasmer::Module> {
-    //let module_bytes = fs::read("quickjs/qjs.wasm")?;
-    let module_bytes = fs::read("out.wasm")?;
+fn load_module(path: impl AsRef<Path>) -> Result<wasmer::Module> {
+    let module_bytes = fs::read(path)?;
 
     // TODO: wasmer/examples/tunables_limit_memory.rs
     let mut cranelift = Cranelift::new();
@@ -1016,18 +1016,26 @@ fn load_module() -> Result<wasmer::Module> {
 pub fn test() -> Result<()> {
     println!("doing wasm things");
 
-    let module = load_module().context("failed to load module")?;
+    let module = load_module("plugins/dist/js.wasm").context("failed to load module")?;
     let store = module.store();
 
     let mut rofs = ROFilesystem::new();
     let work_ino = rofs.mkdir(rofs.root(), b"work".to_vec());
+    let data_ino = rofs.mkdir(rofs.root(), b"data".to_vec());
+
+    let mut ar = tar::Archive::new(fs::File::open("plugins/dist/parity.tar").context("failed to open plugin tar")?);
+    for entry in ar.entries().context("couldn't read entries from tar")? {
+        let mut entry = entry.context("reading entry failed")?;
+        let path = entry.path_bytes().into_owned();
+        let mut data = vec![];
+        entry.read_to_end(&mut data).context("failed to extract data from tar")?;
+        rofs.mkfile(work_ino, path, data);
+    }
 
     for &(mapfrom, mapto) in &[
-        ("plugintest.js", "script.js"),
-        ("bs-parity/scripts/main.js", "bs-parity-main.js"),
-        ("../beatmaps/7f0356d54ded74ed2dbf56e7290a29fde002c0af/ExpertPlusStandard.dat", "7f0356d54ded74ed2dbf56e7290a29fde002c0af-ExpertPlusStandard.dat"),
+        ("../beatmaps/7f0356d54ded74ed2dbf56e7290a29fde002c0af/ExpertPlusStandard.dat", "map.dat"),
     ] {
-        rofs.mkfile(work_ino, mapto.as_bytes().to_owned(), fs::read(mapfrom).expect("failed to read data"));
+        rofs.mkfile(data_ino, mapto.as_bytes().to_owned(), fs::read(mapfrom).expect("failed to read data"));
     }
 
     rofs.calculate_preopens();
@@ -1050,7 +1058,6 @@ pub fn test() -> Result<()> {
     }
 
     let overrides = vec![
-        // WASI
         gen!(args_get, argv, argv_buf),
         gen!(args_sizes_get, argc, argv_buf_size),
         gen!(clock_time_get, clock_id, precision, time),
@@ -1075,17 +1082,7 @@ pub fn test() -> Result<()> {
     match f.call(&[]) {
         Ok(vals) => println!("success: {:?}", vals),
         Err(re) => {
-            println!("fail: {}", re);
-            println!("trace: {:#?}", re.trace());
-            bail!("oh no")
-        }
-    }
-    println!("running: do_analysis");
-    let f = instance.exports.get_function("do_analysis")?;
-    match f.call(&[]) {
-        Ok(vals) => println!("success: {:?}", vals),
-        Err(re) => {
-            println!("fail: {}", re);
+            println!("_start runtime fail: {}", re);
             println!("trace: {:#?}", re.trace());
             bail!("oh no")
         }

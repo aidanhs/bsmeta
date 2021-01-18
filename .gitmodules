@@ -1,0 +1,6 @@
+[submodule "plugins/quickjs"]
+	path = plugins/quickjs
+	url = git@github.com:bellard/quickjs.git
+[submodule "plugins/bs-parity"]
+	path = plugins/bs-parity
+	url = git@github.com:GalaxyMaster2/bs-parity.git
