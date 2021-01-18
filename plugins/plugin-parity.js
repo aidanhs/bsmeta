@@ -5,6 +5,16 @@ globalThis.os = os;
 
 function noop() {}
 
+// Override console.log - stdout is how we're going to grab output
+var oldLog = console.log;
+console.log = function () {
+    var strings = [];
+    for (var i = 0; i < arguments.length; i++) {
+        strings.push(arguments[i].toString());
+    }
+    std.err.puts('stdout:' + strings.join(' ') + '\n');
+}
+
 function getScrollLineHeight() {
     const el = document.createElement('div');
     el.style.fontSize = 'initial';
@@ -50,4 +60,7 @@ ready = true;
 checkParity();
 
 // Return
-console.log(JSON.stringify({summary: SUMMARY, detail: TOTAL_OUTPUT}));
+std.out.puts(JSON.stringify({
+    num_errors: TOTAL_OUTPUT.filter((e) => e[3] === 'error').length,
+    num_warnings: TOTAL_OUTPUT.filter((e) => e[3] === 'warning').length,
+}));

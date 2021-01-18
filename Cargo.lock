@@ -159,6 +159,7 @@ dependencies = [
  "dotenv",
  "env_logger",
  "lewton",
+ "log",
  "reqwest",
  "serde",
  "serde_json",

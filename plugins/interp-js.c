@@ -53,7 +53,8 @@ int run_script() {
 
     int ret;
 
-    const char *base = "import * as std from 'std';\n"
+    const char *base =
+        "import * as std from 'std';\n"
         "import * as os from 'os';\n"
         "globalThis.std = std;\n"
         "globalThis.os = os;\n";

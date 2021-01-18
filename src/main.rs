@@ -104,7 +104,7 @@ const DL_PAUSE: time::Duration = time::Duration::from_secs(10);
 const RATELIMIT_PADDING: time::Duration = time::Duration::from_secs(5);
 
 fn main() {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("bsmeta=info,warn")).init();
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         panic!("wrong num of args")

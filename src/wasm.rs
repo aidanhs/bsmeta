@@ -1,4 +1,5 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use log::{trace, debug, info, warn};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs;
@@ -28,10 +29,10 @@ impl FakeResolver {
         let exports = imports.map(|import| {
             let path = format!("{}:{}", import.module(), import.name());
             if let Some(ex) = overrides.get(&(import.module(), import.name())) {
-                println!("using override for {}", path);
+                debug!("using override for {}", path);
                 return ex.clone()
             }
-            println!("shimming import {:?}", import);
+            debug!("shimming import {:?}", import);
             let ty: &ExternType = import.ty();
             match ty {
                 ExternType::Function(ft) => {
@@ -58,6 +59,7 @@ impl Resolver for FakeResolver {
 mod mywasi {
     use super::WasiCtx;
 
+    use log::trace;
     use std::convert::{TryFrom, TryInto};
     pub use wasi_common::Error;
 
@@ -77,14 +79,14 @@ mod mywasi {
 
     impl types::GuestErrorConversion for WasiCtx {
         fn into_errno(&self, e: wiggle::GuestError) -> Errno {
-            println!("Guest error conversion: {:?}", e);
+            trace!("Guest error conversion: {:?}", e);
             e.into()
         }
     }
 
     impl types::UserErrorConversion for WasiCtx {
         fn errno_from_error(&self, e: Error) -> Result<Errno, wiggle::Trap> {
-            println!("Error conversion: {:?}", e);
+            trace!("Error conversion: {:?}", e);
             e.try_into()
         }
     }
@@ -228,6 +230,8 @@ pub struct ROFilesystem {
     ino: Inode,
     next_fd: u32,
     next_ino: u32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
     fds: HashMap<types::Fd, (Inode, u64)>,
     parent: HashMap<Inode, Inode>,
     data: HashMap<Inode, Vec<u8>>,
@@ -241,6 +245,7 @@ impl ROFilesystem {
         children.insert(ino, Default::default());
         Self {
             ino, next_fd: 3, next_ino: 2,
+            stdout: Default::default(), stderr: Default::default(),
             fds: Default::default(),
             parent: Default::default(),
             data: Default::default(),
@@ -725,9 +730,10 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
         }
         let slices: Vec<_> = guest_slices.iter().map(|s| io::IoSlice::new(s)).collect();
 
+        let mut fs = self.fs();
         let nwritten = match fd.into() {
-            __WASI_STDOUT_FILENO => io::stdout().lock().write_vectored(&slices),
-            __WASI_STDERR_FILENO => io::stderr().lock().write_vectored(&slices),
+            __WASI_STDOUT_FILENO => fs.stdout.write_vectored(&slices),
+            __WASI_STDERR_FILENO => fs.stderr.write_vectored(&slices),
             _ => return Err(mywasi::Error::Badf),
         }.map_err(|_| mywasi::Error::Io)?;
         let nwritten = nwritten.try_into()?;
@@ -848,7 +854,6 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
         _fs_rights_inheriting: types::Rights,
         fdflags: types::Fdflags,
     ) -> WasiResult<types::Fd> {
-        println!("{}", dirflags);
         if dirflags != types::Lookupflags::SYMLINK_FOLLOW {
             unimplemented!()
         }
@@ -1000,31 +1005,27 @@ fn load_module(path: impl AsRef<Path>) -> Result<wasmer::Module> {
     let engine = JIT::new(cranelift).engine();
     let store = Store::new(&engine);
     let module = Module::from_binary(&store, &module_bytes)?;
-    println!("{:?}", module);
-    println!("imports:");
+    debug!("{:?}", module);
+    debug!("imports:");
     for import in module.imports() {
-        println!("{:?}", import)
+        debug!("{:?}", import)
     }
-    println!("exports:");
+    debug!("exports:");
     for export in module.exports() {
-        println!("{:?}", export)
+        debug!("{:?}", export)
     }
 
     Ok(module)
 }
 
-pub fn test() -> Result<()> {
-    println!("doing wasm things");
-
-    let module = load_module("plugins/dist/js.wasm").context("failed to load module")?;
+fn run_plugin(module: Module, mut plugin: tar::Archive<impl Read>, map_dat: Vec<u8>) -> Result<Box<serde_json::value::RawValue>> {
     let store = module.store();
 
     let mut rofs = ROFilesystem::new();
     let work_ino = rofs.mkdir(rofs.root(), b"work".to_vec());
     let data_ino = rofs.mkdir(rofs.root(), b"data".to_vec());
 
-    let mut ar = tar::Archive::new(fs::File::open("plugins/dist/parity.tar").context("failed to open plugin tar")?);
-    for entry in ar.entries().context("couldn't read entries from tar")? {
+    for entry in plugin.entries().context("couldn't read entries from tar")? {
         let mut entry = entry.context("reading entry failed")?;
         let path = entry.path_bytes().into_owned();
         let mut data = vec![];
@@ -1032,14 +1033,10 @@ pub fn test() -> Result<()> {
         rofs.mkfile(work_ino, path, data);
     }
 
-    for &(mapfrom, mapto) in &[
-        ("../beatmaps/7f0356d54ded74ed2dbf56e7290a29fde002c0af/ExpertPlusStandard.dat", "map.dat"),
-    ] {
-        rofs.mkfile(data_ino, mapto.as_bytes().to_owned(), fs::read(mapfrom).expect("failed to read data"));
-    }
+    rofs.mkfile(data_ino, b"map.dat".to_vec(), map_dat);
 
     rofs.calculate_preopens();
-    println!("created a virtualfs with preopens: {:?}", rofs.preopens);
+    debug!("created a virtualfs with preopens: {:?}", rofs.preopens);
 
     let wasi_ctx = WasiCtx::new(rofs);
 
@@ -1048,7 +1045,7 @@ pub fn test() -> Result<()> {
             (
                 ("wasi_snapshot_preview1", stringify!($name)),
                 Function::new_native_with_env(&store, wasi_ctx.clone(), move |env: &WasiCtx, $( $arg ),*| {
-                    println!("wasicall >> {} {:?}", stringify!($name), ($( $arg ),*));
+                    trace!("wasicall >> {} {:?}", stringify!($name), ($( $arg ),*));
                     let bc = env.bc.lock().unwrap();
                     let memory = MemoryWrapper(env.memory_ref().expect("memory not set up"), &bc);
                     mywasi::wasi_snapshot_preview1::$name(env, &memory, $( $arg ),*).expect("wasi call trapped")
@@ -1077,15 +1074,37 @@ pub fn test() -> Result<()> {
 
     let instance = Instance::new(&module, &importobj)?;
 
-    println!("running: _start");
+    debug!("running: _start");
     let f = instance.exports.get_function("_start")?;
-    match f.call(&[]) {
-        Ok(vals) => println!("success: {:?}", vals),
+    let ret = f.call(&[]);
+    let fs = wasi_ctx.fs();
+    debug!("stdout:{{{}}}", String::from_utf8_lossy(&fs.stdout));
+    debug!("stderr:{{{}}}", String::from_utf8_lossy(&fs.stderr));
+    match ret {
+        Ok(vals) => {
+            debug!("success: {:?}", vals);
+            Ok(serde_json::from_slice(&fs.stdout).context("couldn't parse script output")?)
+        },
         Err(re) => {
-            println!("_start runtime fail: {}", re);
-            println!("trace: {:#?}", re.trace());
-            bail!("oh no")
+            warn!("_start runtime fail: {}", re);
+            debug!("trace: {:#?}", re.trace());
+            Err(re).context("failed to run analysis")
         }
+    }
+}
+
+pub fn test() -> Result<()> {
+    let module = load_module("plugins/dist/js.wasm").context("failed to load module")?;
+    for map_dat_path in &[
+        "../beatmaps/7f0356d54ded74ed2dbf56e7290a29fde002c0af/ExpertPlusStandard.dat",
+        "../beatmaps/9a1d001995cc0a2014352aa7148cbcbf2e489d89/Hard.dat",
+        "../beatmaps/28c746c1bbdaa7f10e894b5054c2e80a647ef1f6/ExpertPlusStandard.dat",
+    ] {
+        info!("considering {}", map_dat_path);
+        let ar = tar::Archive::new(fs::File::open("plugins/dist/parity.tar").context("failed to open plugin tar")?);
+        let map_dat = fs::read(map_dat_path)?;
+        let ret = run_plugin(module.clone(), ar, map_dat)?;
+        println!("output: {}", ret.get())
     }
     Ok(())
 }
