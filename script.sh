@@ -20,6 +20,7 @@ elif [ "$1" = doc ]; then
 elif [ "$1" = run ]; then
     shift
     RUST_BACKTRACE=1 WASI_ROOT=$(pwd)/wasmtime/crates/wasi-common/WASI cargo run --release -- "$@"
+    #RUST_BACKTRACE=1 WASI_ROOT=$(pwd)/wasmtime/crates/wasi-common/WASI cargo flamegraph -- "$@"
 
 elif [ "$1" = buildplugins ]; then
     cd quickjs
@@ -46,9 +47,6 @@ elif [ "$1" = buildplugins ]; then
     #gcc -O2 -Wall -lm myeval.c quickjs/libquickjs.a
     #emcc --no-entry $EMFLAGS -O2 -o out.wasm myeval.c quickjs/libquickjs.a
     wasicc -Wl,--allow-undefined -Wl,--export=do_analysis -O2 -o out.wasm myeval.c quickjs/libquickjs.a
-
-elif [ "$1" = run ]; then
-    shift
 
 else
     echo invalid command

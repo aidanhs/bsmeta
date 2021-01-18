@@ -23,6 +23,7 @@ typetag = "0.1"
 
 wasi-common = { path = "wasmtime/crates/wasi-common" }
 wiggle = { path = "wasmtime/crates/wiggle" }
+wiggle-borrow = { path = "wasmtime/crates/wiggle/borrow" }
 
 #wasmer = "1"
 #wasmer-wasi = "1"

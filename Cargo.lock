@@ -168,6 +168,7 @@ dependencies = [
  "wasmer",
  "wasmer-wasi",
  "wiggle",
+ "wiggle-borrow",
  "zip",
 ]
 
@@ -2374,6 +2375,13 @@ dependencies = [
  "tracing",
  "wiggle-macro",
  "witx",
+]
+
+[[package]]
+name = "wiggle-borrow"
+version = "0.22.0"
+dependencies = [
+ "wiggle",
 ]
 
 [[package]]

@@ -17,6 +17,7 @@ use wasmer_wasi::types::{
 use mywasi::wasi_snapshot_preview1::WasiSnapshotPreview1;
 use mywasi::types;
 use wiggle::GuestPtr;
+use wiggle_borrow::BorrowChecker;
 
 struct FakeResolver {
     exports: Vec<Export>,
@@ -153,32 +154,32 @@ mod mywasi {
 
 type WasiResult<T> = std::result::Result<T, mywasi::Error>;
 
-struct MemoryWrapper<'a>(&'a Memory);
+struct MemoryWrapper<'a>(&'a Memory, &'a BorrowChecker);
 
 unsafe impl wiggle::GuestMemory for MemoryWrapper<'_> {
     fn base(&self) -> (*mut u8, u32) {
         (self.0.data_ptr(), self.0.data_size().try_into().expect("memory too big"))
     }
     fn has_outstanding_borrows(&self) -> bool {
-        false
+        self.1.has_outstanding_borrows()
     }
-    fn is_mut_borrowed(&self, _r: wiggle::Region) -> bool {
-        false
+    fn is_mut_borrowed(&self, r: wiggle::Region) -> bool {
+        self.1.is_mut_borrowed(r)
     }
-    fn is_shared_borrowed(&self, _r: wiggle::Region) -> bool {
-        false
+    fn is_shared_borrowed(&self, r: wiggle::Region) -> bool {
+        self.1.is_shared_borrowed(r)
     }
-    fn mut_borrow(&self, _r: wiggle::Region) -> Result<wiggle::BorrowHandle, wiggle::GuestError> {
-        todo!()
+    fn mut_borrow(&self, r: wiggle::Region) -> Result<wiggle::BorrowHandle, wiggle::GuestError> {
+        self.1.mut_borrow(r)
     }
-    fn shared_borrow(&self, _r: wiggle::Region) -> Result<wiggle::BorrowHandle, wiggle::GuestError> {
-        todo!()
+    fn shared_borrow(&self, r: wiggle::Region) -> Result<wiggle::BorrowHandle, wiggle::GuestError> {
+        self.1.shared_borrow(r)
     }
-    fn mut_unborrow(&self, _h: wiggle::BorrowHandle) {
-        todo!()
+    fn mut_unborrow(&self, h: wiggle::BorrowHandle) {
+        self.1.mut_unborrow(h)
     }
-    fn shared_unborrow(&self, _h: wiggle::BorrowHandle) {
-        todo!()
+    fn shared_unborrow(&self, h: wiggle::BorrowHandle) {
+        self.1.shared_unborrow(h)
     }
 }
 
@@ -187,11 +188,16 @@ pub struct WasiCtx {
     fs: Arc<Mutex<ROFilesystem>>,
     #[wasmer(export)]
     memory: LazyInit<Memory>,
+    bc: Arc<Mutex<BorrowChecker>>,
 }
 
 impl WasiCtx {
     fn new(fs: ROFilesystem) -> Self {
-        Self { fs: Arc::new(Mutex::new(fs)), memory: Default::default() }
+        Self {
+            fs: Arc::new(Mutex::new(fs)),
+            memory: Default::default(),
+            bc: Arc::new(Mutex::new(BorrowChecker::new())),
+        }
     }
     fn fs(&self) -> MutexGuard<ROFilesystem> {
         self.fs.lock().unwrap()
@@ -521,9 +527,7 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
         if path_len != name_len {
             return Err(mywasi::Error::Inval)
         }
-        let path_slice = path.as_array(name_len); //.copy_from_slice(&name)?;
-        // TODO: probably pretty slow
-        path_slice.iter().zip(name).map(|(b, &nb)| b.and_then(|b| b.write(nb))).collect::<Result<Vec<_>, _>>()?;
+        path.as_array(name_len).copy_from_slice(&name)?;
         Ok(())
     }
 
@@ -574,23 +578,15 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
 
         let mut fs = self.fs();
         let mut cur = fs.get_file_cursor(fd)?;
-
-        let mut nwritten = 0;
+        let mut guest_slices = vec![];
         for iov_ptr in iovs.iter() {
             let iov_ptr = iov_ptr?;
             let iov: types::Iovec = iov_ptr.read()?;
-            let iov_buf = iov.buf.as_array(iov.buf_len);
-            let expected_len = iov.buf_len.try_into()?;
-            let mut file_data = vec![0u8; expected_len];
-            let n = cur.read(&mut file_data).map_err(|_| mywasi::Error::Io)?;
-            // TODO: probably pretty slow
-            // TODO: really need to use read_vectored
-            iov_buf.iter().zip(&file_data[..n]).map(|(b, &fb)| b.and_then(|b| b.write(fb))).collect::<Result<Vec<_>, _>>()?;
-            nwritten += n;
-            if n != expected_len {
-                break
-            }
+            guest_slices.push(iov.buf.as_array(iov.buf_len).as_slice_mut()?)
         }
+        let mut slices: Vec<_> = guest_slices.iter_mut().map(|s| io::IoSliceMut::new(s)).collect();
+
+        let nwritten = cur.read_vectored(&mut slices).map_err(|_| mywasi::Error::Io)?;
         Ok(nwritten.try_into()?)
     }
 
@@ -724,10 +720,7 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
         for ciov_ptr in ciovs.iter() {
             let ciov_ptr = ciov_ptr?;
             let ciov: types::Ciovec = ciov_ptr.read()?;
-            let ciov_buf = ciov.buf.as_array(ciov.buf_len);
-            // TODO: probably pretty slow
-            let guest_slice = ciov_buf.iter().map(|b| b.and_then(|b| b.read())).collect::<Result<Vec<_>, _>>()?;
-            guest_slices.push(guest_slice)
+            guest_slices.push(ciov.buf.as_array(ciov.buf_len).as_slice()?)
         }
         let slices: Vec<_> = guest_slices.iter().map(|s| io::IoSlice::new(s)).collect();
 
@@ -864,12 +857,10 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
         if fdflags != types::Fdflags::empty() {
             unimplemented!()
         }
-        let path_slice = path.as_bytes();
-        // TODO: probably pretty slow
-        let path_bytes = path_slice.iter().map(|b| b.and_then(|b| b.read())).collect::<Result<Vec<_>, _>>()?;
+        let path_slice = path.as_bytes().as_slice()?;
         let mut fs = self.fs();
         let (dir_ino, _) = fs.fds.get(&dirfd).unwrap();
-        let path_ino = *fs.children.get(dir_ino).unwrap().get(&path_bytes).ok_or(mywasi::Error::Noent)?;
+        let path_ino = *fs.children.get(dir_ino).unwrap().get(&*path_slice).ok_or(mywasi::Error::Noent)?;
         Ok(fs.new_fd(path_ino))
     }
 
@@ -1050,7 +1041,8 @@ pub fn test() -> Result<()> {
                 ("wasi_snapshot_preview1", stringify!($name)),
                 Function::new_native_with_env(&store, wasi_ctx.clone(), move |env: &WasiCtx, $( $arg ),*| {
                     println!("wasicall >> {} {:?}", stringify!($name), ($( $arg ),*));
-                    let memory = MemoryWrapper(env.memory_ref().expect("memory not set up"));
+                    let bc = env.bc.lock().unwrap();
+                    let memory = MemoryWrapper(env.memory_ref().expect("memory not set up"), &bc);
                     mywasi::wasi_snapshot_preview1::$name(env, &memory, $( $arg ),*).expect("wasi call trapped")
                 }).to_export(),
             )
