@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs;
@@ -18,6 +18,41 @@ use mywasi::wasi_snapshot_preview1::WasiSnapshotPreview1;
 use mywasi::types;
 use wiggle::GuestPtr;
 
+struct FakeResolver {
+    exports: Vec<Export>,
+}
+impl FakeResolver {
+    fn new(store: &Store, imports: impl Iterator<Item=ImportType>, overrides: &HashMap<(&str, &str), Export>) -> Self {
+        let exports = imports.map(|import| {
+            let path = format!("{}:{}", import.module(), import.name());
+            if let Some(ex) = overrides.get(&(import.module(), import.name())) {
+                println!("using override for {}", path);
+                return ex.clone()
+            }
+            println!("shimming import {:?}", import);
+            let ty: &ExternType = import.ty();
+            match ty {
+                ExternType::Function(ft) => {
+                    let errfn = move |_vals: &[Val]| -> Result<Vec<Val>, RuntimeError> {
+                        Err(RuntimeError::new(path.clone()))
+                    };
+                    let f = Function::new(store, ft, errfn);
+                    f.to_export()
+                },
+                other => {
+                    todo!("unable to shim {:?}", other)
+                },
+            }
+        }).collect();
+        Self { exports }
+    }
+}
+
+impl Resolver for FakeResolver {
+    fn resolve(&self, index: u32, _module: &str, _field: &str) -> Option<Export> {
+        Some(self.exports[index as usize].clone())
+    }
+}
 mod mywasi {
     use super::WasiCtx;
 
@@ -964,9 +999,7 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
     }
 }
 
-pub fn test() -> Result<()> {
-    println!("doing wasm things");
-
+fn load_module() -> Result<wasmer::Module> {
     //let module_bytes = fs::read("quickjs/qjs.wasm")?;
     let module_bytes = fs::read("out.wasm")?;
 
@@ -986,46 +1019,15 @@ pub fn test() -> Result<()> {
         println!("{:?}", export)
     }
 
-    struct FakeResolver {
-        exports: Vec<Export>,
-    }
-    impl FakeResolver {
-        fn new(store: &Store, imports: impl Iterator<Item=ImportType>, overrides: &HashMap<(&str, &str), Export>) -> Self {
-            let exports = imports.map(|import| {
-                let path = format!("{}:{}", import.module(), import.name());
-                if let Some(ex) = overrides.get(&(import.module(), import.name())) {
-                    println!("using override for {}", path);
-                    return ex.clone()
-                }
-                println!("shimming import {:?}", import);
-                let ty: &ExternType = import.ty();
-                match ty {
-                    ExternType::Function(ft) => {
-                        let errfn = move |_vals: &[Val]| -> Result<Vec<Val>, RuntimeError> {
-                            Err(RuntimeError::new(path.clone()))
-                        };
-                        let f = Function::new(store, ft, errfn);
-                        f.to_export()
-                    },
-                    other => {
-                        todo!("unable to shim {:?}", other)
-                    },
-                }
-            }).collect();
-            Self { exports }
-        }
-    }
-    impl Resolver for FakeResolver {
-        fn resolve(&self, index: u32, _module: &str, _field: &str) -> Option<Export> {
-            Some(self.exports[index as usize].clone())
-        }
-    }
+    Ok(module)
+}
 
-    #[derive(Default, Clone, WasmerEnv)]
-    struct MyEnv {
-        #[wasmer(export)]
-        memory: LazyInit<Memory>,
-    }
+pub fn test() -> Result<()> {
+    println!("doing wasm things");
+
+    let module = load_module().context("failed to load module")?;
+    let store = module.store();
+
     #[derive(Clone, WasmerEnv)]
     struct ScriptEnv {
         script: Vec<u8>,
