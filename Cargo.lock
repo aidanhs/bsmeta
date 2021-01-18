@@ -164,8 +164,10 @@ dependencies = [
  "serde_json",
  "tar",
  "typetag",
+ "wasi-common",
  "wasmer",
  "wasmer-wasi",
+ "wiggle",
  "zip",
 ]
 
@@ -260,6 +262,16 @@ name = "core-foundation-sys"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea221b5284a47e40033bf9b66f35f984ec0ea2931eb03505246cd27a963f981b"
+
+[[package]]
+name = "cpu-time"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e393a7668fe1fad3075085b86c781883000b4ede868f43627b34a87c8b7ded"
+dependencies = [
+ "libc",
+ "winapi 0.3.9",
+]
 
 [[package]]
 name = "cranelift-bforest"
@@ -392,6 +404,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cvt"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34ac344c7efccb80cd25bc61b2170aec26f2f693fd40e765a539a1243db48c71"
+dependencies = [
+ "cfg-if 0.1.10",
+]
+
+[[package]]
 name = "darling"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -461,6 +482,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs-next"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b98cf8ebf19c3d1b223e151f99a4f9f0690dca41414773390fc824184ac833e1"
+dependencies = [
+ "cfg-if 1.0.0",
+ "dirs-sys-next",
+]
+
+[[package]]
+name = "dirs-sys-next"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ebda144c4fe02d1f7ea1a7d9641b6fc6b580adcfa024ae48797ecdeb6825b4d"
+dependencies = [
+ "libc",
+ "redox_users",
+ "winapi 0.3.9",
+]
+
+[[package]]
 name = "dotenv"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -517,7 +559,7 @@ checksum = "0c122a393ea57648015bf06fbd3d372378992e86b9ff5a7a497b076a28c79efe"
 dependencies = [
  "cfg-if 1.0.0",
  "libc",
- "redox_syscall",
+ "redox_syscall 0.1.57",
  "winapi 0.3.9",
 ]
 
@@ -716,6 +758,15 @@ name = "hashbrown"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7afe4a420e3fe79967a00898cc1f4db7c8a49a9333a29f8a4bd76a253d5cd04"
+
+[[package]]
+name = "heck"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87cbf45460356b7deeb5e3415b5563308c0a9b057c85e12b06ad551f98d0a6ac"
+dependencies = [
+ "unicode-segmentation",
+]
 
 [[package]]
 name = "hermit-abi"
@@ -1379,6 +1430,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41cc0f7e4d5d4544e8861606a285bb08d3e70712ccc7d2b84d7c0ccfaf4b05ce"
 
 [[package]]
+name = "redox_syscall"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05ec8ca9416c5ea37062b502703cd7fcb207736bc294f6e0cf367ac6fc234570"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
+name = "redox_users"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528532f3d801c87aec9def2add9ca802fe569e44a544afe633765267840abe64"
+dependencies = [
+ "getrandom 0.2.1",
+ "redox_syscall 0.2.4",
+]
+
+[[package]]
 name = "regalloc"
 version = "0.0.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1598,6 +1668,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shellexpand"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83bdb7831b2d85ddf4a7b148aa19d0587eddbe8671a436b7bd1182eaad0f2829"
+dependencies = [
+ "dirs-next",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1651,7 +1730,7 @@ checksum = "489997b7557e9a43e192c527face4feacc78bfbe6eed67fd55c4c9e381cba290"
 dependencies = [
  "filetime",
  "libc",
- "redox_syscall",
+ "redox_syscall 0.1.57",
  "xattr",
 ]
 
@@ -1670,7 +1749,7 @@ dependencies = [
  "cfg-if 0.1.10",
  "libc",
  "rand",
- "redox_syscall",
+ "redox_syscall 0.1.57",
  "remove_dir_all",
  "winapi 0.3.9",
 ]
@@ -1894,6 +1973,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "unicode-segmentation"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb0d2e7be6ae3a5fa87eed5fb451aff96f2573d2694942e40543ae0bbe19c796"
+
+[[package]]
 name = "unicode-xid"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1944,6 +2029,25 @@ name = "wasi"
 version = "0.10.0+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a143597ca7c7793eff794def352d41792a93c481eb1042423ff7ff72ba2c31f"
+
+[[package]]
+name = "wasi-common"
+version = "0.22.0"
+dependencies = [
+ "anyhow",
+ "cfg-if 1.0.0",
+ "cpu-time",
+ "filetime",
+ "getrandom 0.2.1",
+ "lazy_static",
+ "libc",
+ "thiserror",
+ "tracing",
+ "wiggle",
+ "winapi 0.3.9",
+ "winx",
+ "yanix",
+]
 
 [[package]]
 name = "wasm-bindgen"
@@ -2216,6 +2320,15 @@ checksum = "87cc2fe6350834b4e528ba0901e7aa405d78b89dc1fa3145359eb4de0e323fcf"
 
 [[package]]
 name = "wast"
+version = "22.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe1220ed7f824992b426a76125a3403d048eaf0f627918e97ade0d9b9d510d20"
+dependencies = [
+ "leb128",
+]
+
+[[package]]
+name = "wast"
 version = "30.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b79907b22f740634810e882d8d1d9d0f9563095a8ab94e786e370242bff5cd2"
@@ -2229,7 +2342,7 @@ version = "1.0.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8279a02835bf12e61ed2b3c3cbc6ecf9918762fd97e036917c11a09ec20ca44"
 dependencies = [
- "wast",
+ "wast 30.0.0",
 ]
 
 [[package]]
@@ -2250,6 +2363,40 @@ checksum = "87c14ef7e1b8b8ecfc75d5eca37949410046e66f15d185c01d70824f1f8111ef"
 dependencies = [
  "libc",
  "thiserror",
+]
+
+[[package]]
+name = "wiggle"
+version = "0.22.0"
+dependencies = [
+ "bitflags",
+ "thiserror",
+ "tracing",
+ "wiggle-macro",
+ "witx",
+]
+
+[[package]]
+name = "wiggle-generate"
+version = "0.22.0"
+dependencies = [
+ "anyhow",
+ "heck",
+ "proc-macro2",
+ "quote",
+ "shellexpand",
+ "syn",
+ "witx",
+]
+
+[[package]]
+name = "wiggle-macro"
+version = "0.22.0"
+dependencies = [
+ "quote",
+ "syn",
+ "wiggle-generate",
+ "witx",
 ]
 
 [[package]]
@@ -2305,6 +2452,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "winx"
+version = "0.22.0"
+dependencies = [
+ "bitflags",
+ "cvt",
+ "winapi 0.3.9",
+]
+
+[[package]]
+name = "witx"
+version = "0.8.8"
+dependencies = [
+ "anyhow",
+ "log",
+ "thiserror",
+ "wast 22.0.0",
+]
+
+[[package]]
 name = "ws2_32-sys"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2321,6 +2487,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "244c3741f4240ef46274860397c7c74e50eb23624996930e484c16679633a54c"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "yanix"
+version = "0.22.0"
+dependencies = [
+ "bitflags",
+ "cfg-if 1.0.0",
+ "filetime",
+ "libc",
+ "tracing",
 ]
 
 [[package]]

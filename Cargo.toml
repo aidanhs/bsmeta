@@ -20,6 +20,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 tar = "0.4"
 typetag = "0.1"
+
+wasi-common = { path = "wasmtime/crates/wasi-common" }
+wiggle = { path = "wasmtime/crates/wiggle" }
+
 #wasmer = "1"
 #wasmer-wasi = "1"
 wasmer = { path = "wasmer/lib/api" }

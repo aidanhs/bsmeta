@@ -1,56 +1,968 @@
-use anyhow::{Context, Result, anyhow, bail};
-use std::cell::Cell;
+use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Seek, Read, Write};
 use std::sync::Arc;
 use std::sync::Mutex;
-use serde::{Deserialize, Serialize};
+use std::sync::MutexGuard;
 
-use wasmer::{Array, WasmPtr, ValueType, LazyInit, Memory, Store, WasmerEnv, LikeNamespace, Cranelift, JIT, Exports, Export, Exportable, Val, ExternType, Function, ImportType, Resolver, Module, Instance, Value, imports, RuntimeError};
-use wasmer_wasi::{WasiFsError, WasiFile, WasiState, WasiFs, VIRTUAL_ROOT_FD, WasiEnv, WasiVersion};
-use wasmer_wasi::ALL_RIGHTS;
+use wasmer::{Array, WasmPtr, LazyInit, Memory, Store, WasmerEnv, Cranelift, JIT, Export, Exportable, Val, ExternType, Function, ImportType, Resolver, Module, Instance, RuntimeError};
 use wasmer_wasi::types::{
-    __wasi_iovec_t,
-    __wasi_ciovec_t,
-    __wasi_errno_t,
-    __wasi_fdstat_t,
-    __wasi_prestat_t,
-    __wasi_prestat_u,
-    __wasi_prestat_u_dir_t,
-    __wasi_fd_t,
-    __wasi_rights_t,
-    __wasi_fdflags_t,
-    __wasi_lookupflags_t,
-    __wasi_oflags_t,
-    __wasi_timestamp_t,
-    __wasi_filesize_t,
-    __wasi_whence_t,
-    __wasi_filedelta_t,
-
-    __WASI_WHENCE_CUR,
-    __WASI_WHENCE_END,
-    __WASI_WHENCE_SET,
-
-    __WASI_LOOKUP_SYMLINK_FOLLOW,
-
-    __WASI_FILETYPE_DIRECTORY,
-
-    __WASI_PREOPENTYPE_DIR,
-
-    __WASI_ESUCCESS,
-    __WASI_EINVAL,
-    __WASI_EFAULT,
-    __WASI_EBADF,
-    __WASI_EIO,
-    __WASI_EACCES,
-    __WASI_EISDIR,
-
     __WASI_STDIN_FILENO,
     __WASI_STDOUT_FILENO,
     __WASI_STDERR_FILENO,
 };
+
+use mywasi::wasi_snapshot_preview1::WasiSnapshotPreview1;
+use mywasi::types;
+use wiggle::GuestPtr;
+
+mod mywasi {
+    use super::WasiCtx;
+
+    use std::convert::{TryFrom, TryInto};
+    pub use wasi_common::Error;
+
+    wiggle::from_witx!({
+        witx: ["$WASI_ROOT/phases/snapshot/witx/wasi_snapshot_preview1.witx"],
+        ctx: WasiCtx,
+        errors: { errno => Error },
+    });
+
+    use types::Errno;
+
+    impl wiggle::GuestErrorType for Errno {
+        fn success() -> Self {
+            Self::Success
+        }
+    }
+
+    impl types::GuestErrorConversion for WasiCtx {
+        fn into_errno(&self, e: wiggle::GuestError) -> Errno {
+            println!("Guest error conversion: {:?}", e);
+            e.into()
+        }
+    }
+
+    impl types::UserErrorConversion for WasiCtx {
+        fn errno_from_error(&self, e: Error) -> Result<Errno, wiggle::Trap> {
+            println!("Error conversion: {:?}", e);
+            e.try_into()
+        }
+    }
+
+    impl TryFrom<Error> for Errno {
+        type Error = wiggle::Trap;
+        fn try_from(e: Error) -> Result<Errno, wiggle::Trap> {
+            match e {
+                Error::Guest(e) => Ok(e.into()),
+                Error::TryFromInt(_) => Ok(Errno::Overflow),
+                Error::Utf8(_) => Ok(Errno::Ilseq),
+                Error::UnexpectedIo(_) => Ok(Errno::Io),
+                Error::GetRandom(_) => Ok(Errno::Io),
+                Error::TooBig => Ok(Errno::TooBig),
+                Error::Acces => Ok(Errno::Acces),
+                Error::Badf => Ok(Errno::Badf),
+                Error::Busy => Ok(Errno::Busy),
+                Error::Exist => Ok(Errno::Exist),
+                Error::Fault => Ok(Errno::Fault),
+                Error::Fbig => Ok(Errno::Fbig),
+                Error::Ilseq => Ok(Errno::Ilseq),
+                Error::Inval => Ok(Errno::Inval),
+                Error::Io => Ok(Errno::Io),
+                Error::Isdir => Ok(Errno::Isdir),
+                Error::Loop => Ok(Errno::Loop),
+                Error::Mfile => Ok(Errno::Mfile),
+                Error::Mlink => Ok(Errno::Mlink),
+                Error::Nametoolong => Ok(Errno::Nametoolong),
+                Error::Nfile => Ok(Errno::Nfile),
+                Error::Noent => Ok(Errno::Noent),
+                Error::Nomem => Ok(Errno::Nomem),
+                Error::Nospc => Ok(Errno::Nospc),
+                Error::Notdir => Ok(Errno::Notdir),
+                Error::Notempty => Ok(Errno::Notempty),
+                Error::Notsup => Ok(Errno::Notsup),
+                Error::Overflow => Ok(Errno::Overflow),
+                Error::Pipe => Ok(Errno::Pipe),
+                Error::Perm => Ok(Errno::Perm),
+                Error::Spipe => Ok(Errno::Spipe),
+                Error::Notcapable => Ok(Errno::Notcapable),
+                Error::Unsupported(feature) => {
+                    Err(wiggle::Trap::String(format!("unsupported: {}", feature)))
+                }
+            }
+        }
+    }
+
+    impl From<wiggle::GuestError> for Errno {
+        fn from(err: wiggle::GuestError) -> Self {
+            use wiggle::GuestError::*;
+            match err {
+                InvalidFlagValue { .. } => Self::Inval,
+                InvalidEnumValue { .. } => Self::Inval,
+                PtrOverflow { .. } => Self::Fault,
+                PtrOutOfBounds { .. } => Self::Fault,
+                PtrNotAligned { .. } => Self::Inval,
+                PtrBorrowed { .. } => Self::Fault,
+                InvalidUtf8 { .. } => Self::Ilseq,
+                TryFromIntError { .. } => Self::Overflow,
+                InFunc { .. } => Self::Inval,
+                InDataField { .. } => Self::Inval,
+                SliceLengthsDiffer { .. } => Self::Fault,
+                BorrowCheckerOutOfHandles { .. } => Self::Fault,
+            }
+        }
+    }
+}
+
+type WasiResult<T> = std::result::Result<T, mywasi::Error>;
+
+struct MemoryWrapper<'a>(&'a Memory);
+
+unsafe impl wiggle::GuestMemory for MemoryWrapper<'_> {
+    fn base(&self) -> (*mut u8, u32) {
+        (self.0.data_ptr(), self.0.data_size().try_into().expect("memory too big"))
+    }
+    fn has_outstanding_borrows(&self) -> bool {
+        false
+    }
+    fn is_mut_borrowed(&self, _r: wiggle::Region) -> bool {
+        false
+    }
+    fn is_shared_borrowed(&self, _r: wiggle::Region) -> bool {
+        false
+    }
+    fn mut_borrow(&self, _r: wiggle::Region) -> Result<wiggle::BorrowHandle, wiggle::GuestError> {
+        todo!()
+    }
+    fn shared_borrow(&self, _r: wiggle::Region) -> Result<wiggle::BorrowHandle, wiggle::GuestError> {
+        todo!()
+    }
+    fn mut_unborrow(&self, _h: wiggle::BorrowHandle) {
+        todo!()
+    }
+    fn shared_unborrow(&self, _h: wiggle::BorrowHandle) {
+        todo!()
+    }
+}
+
+#[derive(Clone, WasmerEnv)]
+pub struct WasiCtx {
+    fs: Arc<Mutex<ROFilesystem>>,
+    #[wasmer(export)]
+    memory: LazyInit<Memory>,
+}
+
+impl WasiCtx {
+    fn new(fs: ROFilesystem) -> Self {
+        Self { fs: Arc::new(Mutex::new(fs)), memory: Default::default() }
+    }
+    fn fs(&self) -> MutexGuard<ROFilesystem> {
+        self.fs.lock().unwrap()
+    }
+}
+
+#[derive(Copy, Clone, Hash, Eq, PartialEq)]
+pub struct Inode(u32);
+
+pub struct FileCursor<'a> {
+    pos: &'a mut u64,
+    cur: io::Cursor<&'a Vec<u8>>,
+}
+impl Seek for FileCursor<'_> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> { self.cur.seek(pos) }
+}
+impl Read for FileCursor<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { self.cur.read(buf) }
+}
+impl Drop for FileCursor<'_> {
+    fn drop(&mut self) {
+        *self.pos = self.cur.position()
+    }
+}
+
+pub struct ROFilesystem {
+    ino: Inode,
+    next_fd: u32,
+    next_ino: u32,
+    fds: HashMap<types::Fd, (Inode, u64)>,
+    parent: HashMap<Inode, Inode>,
+    data: HashMap<Inode, Vec<u8>>,
+    children: HashMap<Inode, HashMap<Vec<u8>, Inode>>,
+    preopens: HashMap<types::Fd, Vec<u8>>,
+}
+impl ROFilesystem {
+    fn new() -> Self {
+        let ino = Inode(1);
+        let mut children = HashMap::new();
+        children.insert(ino, Default::default());
+        Self {
+            ino, next_fd: 3, next_ino: 2,
+            fds: Default::default(),
+            parent: Default::default(),
+            data: Default::default(),
+            children,
+            preopens: Default::default(),
+        }
+    }
+    fn new_fd(&mut self, ino: Inode) -> types::Fd {
+        let fd = self.next_fd.into();
+        self.next_fd += 1;
+        assert!(self.fds.insert(fd, (ino, 0)).is_none());
+        fd
+    }
+    fn root(&self) -> Inode { self.ino }
+
+    fn get_file_cursor(&mut self, fd: types::Fd) -> WasiResult<FileCursor> {
+        let (ino, pos) = self.fds.get_mut(&fd).ok_or(mywasi::Error::Badf)?;
+        let data = self.data.get(&ino).ok_or(mywasi::Error::Isdir)?;
+        let mut cur = io::Cursor::new(data);
+        cur.set_position(*pos);
+        Ok(FileCursor { pos, cur })
+    }
+
+    // It checks fds after 2 until it gets EBADF and treats each of them as a preopen
+    // https://github.com/WebAssembly/wasi-libc/blob/5b148b6131f36770f110c24d61adfb1e17fea06a/libc-bottom-half/sources/preopens.c#L201
+    fn calculate_preopens(&mut self) {
+        let children = self.children.get(&self.root()).expect("no root").clone();
+        for (name, ino) in children {
+            assert!(self.children.contains_key(&ino), "preopen is not a dir");
+            let fd = self.new_fd(ino);
+            let mut preopen_name = Vec::with_capacity(name.len()+1);
+            preopen_name.push(b'/');
+            preopen_name.extend(name);
+            assert!(self.preopens.insert(fd, preopen_name).is_none())
+        }
+    }
+
+    fn mknod(&mut self, parent: Inode, name: Vec<u8>) -> Inode {
+        let ino = Inode(self.next_ino);
+        self.next_ino += 1;
+        assert!(self.children.get_mut(&parent).expect("no parent").insert(name, ino).is_none());
+        assert!(self.parent.insert(ino, parent).is_none());
+        ino
+    }
+    fn mkdir(&mut self, parent: Inode, name: Vec<u8>) -> Inode {
+        let ino = self.mknod(parent, name);
+        assert!(self.children.insert(ino, Default::default()).is_none());
+        ino
+    }
+    fn mkfile(&mut self, parent: Inode, name: Vec<u8>, data: Vec<u8>) -> Inode {
+        let ino = self.mknod(parent, name);
+        assert!(self.data.insert(ino, data).is_none());
+        ino
+    }
+}
+
+impl<'a> WasiSnapshotPreview1 for WasiCtx {
+    fn args_get<'b>(
+        &self,
+        _argv: &GuestPtr<'b, GuestPtr<'b, u8>>,
+        _argv_buf: &GuestPtr<'b, u8>,
+    ) -> WasiResult<()> {
+        Ok(())
+    }
+
+    fn args_sizes_get(&self) -> WasiResult<(types::Size, types::Size)> {
+        Ok((0, 0))
+    }
+
+    fn environ_get<'b>(
+        &self,
+        _environ: &GuestPtr<'b, GuestPtr<'b, u8>>,
+        _environ_buf: &GuestPtr<'b, u8>,
+    ) -> WasiResult<()> {
+        todo!()
+        //self.env.write_to_guest(environ_buf, environ)
+    }
+
+    fn environ_sizes_get(&self) -> WasiResult<(types::Size, types::Size)> {
+        Ok((0, 0))
+    }
+
+    fn clock_res_get(
+        &self,
+        _id: types::Clockid
+    ) -> WasiResult<types::Timestamp> {
+        unimplemented!("clock_res_get")
+    }
+
+    fn clock_time_get(
+        &self,
+        _id: types::Clockid,
+        _precision: types::Timestamp,
+    ) -> WasiResult<types::Timestamp> {
+        Ok(0)
+    }
+
+    fn fd_advise(
+        &self,
+        _fd: types::Fd,
+        _offset: types::Filesize,
+        _len: types::Filesize,
+        _advice: types::Advice,
+    ) -> WasiResult<()> {
+        unimplemented!("fd_advise")
+    }
+
+    fn fd_allocate(
+        &self,
+        _fd: types::Fd,
+        _offset: types::Filesize,
+        _len: types::Filesize,
+    ) -> WasiResult<()> {
+        todo!()
+        //let required_rights = HandleRights::from_base(types::Rights::FD_ALLOCATE);
+        //let entry = self.get_entry(fd)?;
+        //entry.as_handle(&required_rights)?.allocate(offset, len)
+    }
+
+    fn fd_close(
+        &self,
+        fd: types::Fd
+    ) -> WasiResult<()> {
+        let mut fs = self.fs();
+        if fs.preopens.contains_key(&fd) {
+            return Err(mywasi::Error::Notsup)
+        }
+        match fs.fds.remove(&fd) {
+            Some(_) => Ok(()),
+            None => Err(mywasi::Error::Badf)
+        }
+    }
+
+    fn fd_datasync(
+        &self,
+        _fd: types::Fd
+    ) -> WasiResult<()> {
+        unimplemented!("fd_datasync")
+    }
+
+    fn fd_fdstat_get(
+        &self,
+        fd: types::Fd
+    ) -> WasiResult<types::Fdstat> {
+        let fs = self.fs();
+        let fs_filetype = match fd.into() {
+            __WASI_STDIN_FILENO |
+            __WASI_STDOUT_FILENO |
+            __WASI_STDERR_FILENO => types::Filetype::CharacterDevice,
+            _ => {
+                let (ino, _) = fs.fds.get(&fd).ok_or(mywasi::Error::Badf)?;
+                if fs.data.contains_key(ino) {
+                    types::Filetype::RegularFile
+                } else if fs.children.contains_key(ino) {
+                    types::Filetype::Directory
+                } else {
+                    return Err(mywasi::Error::Noent)
+                }
+            },
+        };
+        Ok(types::Fdstat {
+            fs_filetype,
+            fs_flags: types::Fdflags::empty(),
+            fs_rights_base: types::Rights::all(),
+            fs_rights_inheriting: types::Rights::all(),
+        })
+    }
+
+    fn fd_fdstat_set_flags(
+        &self,
+        _fd: types::Fd,
+        _flags: types::Fdflags
+    ) -> WasiResult<()> {
+        todo!()
+        //let required_rights = HandleRights::from_base(types::Rights::FD_FDSTAT_SET_FLAGS);
+        //let entry = self.get_entry(fd)?;
+        //entry.as_handle(&required_rights)?.fdstat_set_flags(flags)
+    }
+
+    fn fd_fdstat_set_rights(
+        &self,
+        _fd: types::Fd,
+        _fs_rights_base: types::Rights,
+        _fs_rights_inheriting: types::Rights,
+    ) -> WasiResult<()> {
+        todo!()
+        //let rights = HandleRights::new(fs_rights_base, fs_rights_inheriting);
+        //let entry = self.get_entry(fd)?;
+        //if !entry.get_rights().contains(&rights) {
+        //    return Err(Error::Notcapable);
+        //}
+        //entry.set_rights(rights);
+        //Ok(())
+    }
+
+    fn fd_filestat_get(
+        &self,
+        _fd: types::Fd
+    ) -> WasiResult<types::Filestat> {
+        todo!()
+        //let required_rights = HandleRights::from_base(types::Rights::FD_FILESTAT_GET);
+        //let entry = self.get_entry(fd)?;
+        //let host_filestat = entry.as_handle(&required_rights)?.filestat_get()?;
+        //Ok(host_filestat)
+    }
+
+    fn fd_filestat_set_size(
+        &self,
+        _fd: types::Fd,
+        _size: types::Filesize
+    ) -> WasiResult<()> {
+        todo!()
+        //let required_rights = HandleRights::from_base(types::Rights::FD_FILESTAT_SET_SIZE);
+        //let entry = self.get_entry(fd)?;
+        //entry.as_handle(&required_rights)?.filestat_set_size(size)
+    }
+
+    fn fd_filestat_set_times(
+        &self,
+        _fd: types::Fd,
+        _atim: types::Timestamp,
+        _mtim: types::Timestamp,
+        _fst_flags: types::Fstflags,
+    ) -> WasiResult<()> {
+        todo!()
+        //let required_rights = HandleRights::from_base(types::Rights::FD_FILESTAT_SET_TIMES);
+        //let entry = self.get_entry(fd)?;
+        //entry
+        //    .as_handle(&required_rights)?
+        //    .filestat_set_times(atim, mtim, fst_flags)
+    }
+
+    fn fd_pread(
+        &self,
+        _fd: types::Fd,
+        _iovs: &types::IovecArray<'_>,
+        _offset: types::Filesize,
+    ) -> WasiResult<types::Size> {
+        todo!()
+        //let mut guest_slices: Vec<GuestSliceMut<'_, u8>> = Vec::new();
+        //for iov_ptr in iovs.iter() {
+        //    let iov_ptr = iov_ptr?;
+        //    let iov: types::Iovec = iov_ptr.read()?;
+        //    guest_slices.push(iov.buf.as_array(iov.buf_len).as_slice_mut()?);
+        //}
+
+        //let required_rights =
+        //    HandleRights::from_base(types::Rights::FD_READ | types::Rights::FD_SEEK);
+        //let entry = self.get_entry(fd)?;
+        //if offset > i64::max_value() as u64 {
+        //    return Err(Error::Io);
+        //}
+
+        //let host_nread = {
+        //    let mut buf = guest_slices
+        //        .iter_mut()
+        //        .map(|s| io::IoSliceMut::new(&mut *s))
+        //        .collect::<Vec<io::IoSliceMut<'_>>>();
+        //    entry
+        //        .as_handle(&required_rights)?
+        //        .preadv(&mut buf, offset)?
+        //        .try_into()?
+        //};
+        //Ok(host_nread)
+    }
+
+    fn fd_prestat_get(
+        &self,
+        fd: types::Fd
+    ) -> WasiResult<types::Prestat> {
+        let fs = self.fs();
+        let name = fs.preopens.get(&fd).ok_or(mywasi::Error::Badf)?;
+        Ok(types::Prestat::Dir(types::PrestatDir { pr_name_len: name.len().try_into()? }))
+    }
+
+    fn fd_prestat_dir_name(
+        &self,
+        fd: types::Fd,
+        path: &GuestPtr<u8>,
+        path_len: types::Size,
+    ) -> WasiResult<()> {
+        let fs = self.fs();
+        let name = fs.preopens.get(&fd).ok_or(mywasi::Error::Badf)?;
+        let name_len: u32 = name.len().try_into()?;
+        if path_len != name_len {
+            return Err(mywasi::Error::Inval)
+        }
+        let path_slice = path.as_array(name_len); //.copy_from_slice(&name)?;
+        // TODO: probably pretty slow
+        path_slice.iter().zip(name).map(|(b, &nb)| b.and_then(|b| b.write(nb))).collect::<Result<Vec<_>, _>>()?;
+        Ok(())
+    }
+
+    fn fd_pwrite(
+        &self,
+        _fd: types::Fd,
+        _ciovs: &types::CiovecArray<'_>,
+        _offset: types::Filesize,
+    ) -> WasiResult<types::Size> {
+        todo!()
+        //let mut guest_slices = Vec::new();
+        //for ciov_ptr in ciovs.iter() {
+        //    let ciov_ptr = ciov_ptr?;
+        //    let ciov: types::Ciovec = ciov_ptr.read()?;
+        //    guest_slices.push(ciov.buf.as_array(ciov.buf_len).as_slice()?);
+        //}
+
+        //let required_rights =
+        //    HandleRights::from_base(types::Rights::FD_WRITE | types::Rights::FD_SEEK);
+        //let entry = self.get_entry(fd)?;
+
+        //if offset > i64::max_value() as u64 {
+        //    return Err(Error::Io);
+        //}
+
+        //let host_nwritten = {
+        //    let buf: Vec<io::IoSlice> =
+        //        guest_slices.iter().map(|s| io::IoSlice::new(&*s)).collect();
+        //    entry
+        //        .as_handle(&required_rights)?
+        //        .pwritev(&buf, offset)?
+        //        .try_into()?
+        //};
+        //Ok(host_nwritten)
+    }
+
+    fn fd_read(
+        &self,
+        fd: types::Fd,
+        iovs: &types::IovecArray<'_>
+    ) -> WasiResult<types::Size> {
+        match fd.into() {
+            __WASI_STDOUT_FILENO |
+            __WASI_STDERR_FILENO => return Err(mywasi::Error::Inval),
+            __WASI_STDIN_FILENO => return Ok(0),
+            _ => (),
+        }
+
+        let mut fs = self.fs();
+        let mut cur = fs.get_file_cursor(fd)?;
+
+        let mut nwritten = 0;
+        for iov_ptr in iovs.iter() {
+            let iov_ptr = iov_ptr?;
+            let iov: types::Iovec = iov_ptr.read()?;
+            let iov_buf = iov.buf.as_array(iov.buf_len);
+            let expected_len = iov.buf_len.try_into()?;
+            let mut file_data = vec![0u8; expected_len];
+            let n = cur.read(&mut file_data).map_err(|_| mywasi::Error::Io)?;
+            // TODO: probably pretty slow
+            // TODO: really need to use read_vectored
+            iov_buf.iter().zip(&file_data[..n]).map(|(b, &fb)| b.and_then(|b| b.write(fb))).collect::<Result<Vec<_>, _>>()?;
+            nwritten += n;
+            if n != expected_len {
+                break
+            }
+        }
+        Ok(nwritten.try_into()?)
+    }
+
+    fn fd_readdir(
+        &self,
+        _fd: types::Fd,
+        _buf: &GuestPtr<u8>,
+        _buf_len: types::Size,
+        _cookie: types::Dircookie,
+    ) -> WasiResult<types::Size> {
+        todo!()
+        //let required_rights = HandleRights::from_base(types::Rights::FD_READDIR);
+        //let entry = self.get_entry(fd)?;
+
+        //let mut bufused = 0;
+        //let mut buf = buf.clone();
+        //for pair in entry.as_handle(&required_rights)?.readdir(cookie)? {
+        //    let (dirent, name) = pair?;
+        //    let dirent_raw = dirent.as_bytes()?;
+        //    let dirent_len: types::Size = dirent_raw.len().try_into()?;
+        //    let name_raw = name.as_bytes();
+        //    let name_len = name_raw.len().try_into()?;
+        //    let offset = dirent_len.checked_add(name_len).ok_or(Error::Overflow)?;
+
+        //    // Copy as many bytes of the dirent as we can, up to the end of the buffer.
+        //    let dirent_copy_len = min(dirent_len, buf_len - bufused);
+        //    buf.as_array(dirent_copy_len)
+        //        .copy_from_slice(&dirent_raw[..dirent_copy_len as usize])?;
+
+        //    // If the dirent struct wasn't copied entirely, return that we
+        //    // filled the buffer, which tells libc that we're not at EOF.
+        //    if dirent_copy_len < dirent_len {
+        //        return Ok(buf_len);
+        //    }
+
+        //    buf = buf.add(dirent_copy_len)?;
+
+        //    // Copy as many bytes of the name as we can, up to the end of the buffer.
+        //    let name_copy_len = min(name_len, buf_len - bufused);
+        //    buf.as_array(name_copy_len)
+        //        .copy_from_slice(&name_raw[..name_copy_len as usize])?;
+
+        //    // If the dirent struct wasn't copied entirely, return that we
+        //    // filled the buffer, which tells libc that we're not at EOF.
+        //    if name_copy_len < name_len {
+        //        return Ok(buf_len);
+        //    }
+
+        //    buf = buf.add(name_copy_len)?;
+
+        //    bufused += offset;
+        //}
+
+        //Ok(bufused)
+    }
+
+    fn fd_renumber(
+        &self,
+        _from: types::Fd,
+        _to: types::Fd
+    ) -> WasiResult<()> {
+        todo!()
+        //if !self.contains_entry(from) {
+        //    return Err(Error::Badf);
+        //}
+
+        //// Don't allow renumbering over a pre-opened resource.
+        //// TODO: Eventually, we do want to permit this, once libpreopen in
+        //// userspace is capable of removing entries from its tables as well.
+        //if let Ok(from_fe) = self.get_entry(from) {
+        //    if from_fe.preopen_path.is_some() {
+        //        return Err(Error::Notsup);
+        //    }
+        //}
+        //if let Ok(to_fe) = self.get_entry(to) {
+        //    if to_fe.preopen_path.is_some() {
+        //        return Err(Error::Notsup);
+        //    }
+        //}
+        //let fe = self.remove_entry(from)?;
+        //self.insert_entry_at(to, fe);
+        //Ok(())
+    }
+
+    fn fd_seek(
+        &self,
+        fd: types::Fd,
+        offset: types::Filedelta,
+        whence: types::Whence,
+    ) -> WasiResult<types::Filesize> {
+        let seek = match whence {
+            types::Whence::Cur => io::SeekFrom::Current(offset),
+            types::Whence::End => io::SeekFrom::End(offset),
+            types::Whence::Set => io::SeekFrom::Start(offset as u64),
+        };
+        let fs = &mut *self.fs();
+        let mut cur = fs.get_file_cursor(fd)?;
+        let pos = cur.seek(seek)?;
+        Ok(pos)
+    }
+
+    fn fd_sync(
+        &self,
+        _fd: types::Fd
+    ) -> WasiResult<()> {
+        todo!()
+        //let required_rights = HandleRights::from_base(types::Rights::FD_SYNC);
+        //let entry = self.get_entry(fd)?;
+        //entry.as_handle(&required_rights)?.sync()
+    }
+
+    fn fd_tell(
+        &self,
+        _fd: types::Fd
+    ) -> WasiResult<types::Filesize> {
+        todo!()
+        //let required_rights = HandleRights::from_base(types::Rights::FD_TELL);
+        //let entry = self.get_entry(fd)?;
+        //let host_offset = entry
+        //    .as_handle(&required_rights)?
+        //    .seek(SeekFrom::Current(0))?;
+        //Ok(host_offset)
+    }
+
+    fn fd_write(
+        &self,
+        fd: types::Fd,
+        ciovs: &types::CiovecArray<'_>
+    ) -> WasiResult<types::Size> {
+        let mut guest_slices = vec![];
+        for ciov_ptr in ciovs.iter() {
+            let ciov_ptr = ciov_ptr?;
+            let ciov: types::Ciovec = ciov_ptr.read()?;
+            let ciov_buf = ciov.buf.as_array(ciov.buf_len);
+            // TODO: probably pretty slow
+            let guest_slice = ciov_buf.iter().map(|b| b.and_then(|b| b.read())).collect::<Result<Vec<_>, _>>()?;
+            guest_slices.push(guest_slice)
+        }
+        let slices: Vec<_> = guest_slices.iter().map(|s| io::IoSlice::new(s)).collect();
+
+        let nwritten = match fd.into() {
+            __WASI_STDOUT_FILENO => io::stdout().lock().write_vectored(&slices),
+            __WASI_STDERR_FILENO => io::stderr().lock().write_vectored(&slices),
+            _ => return Err(mywasi::Error::Badf),
+        }.map_err(|_| mywasi::Error::Io)?;
+        let nwritten = nwritten.try_into()?;
+        Ok(nwritten)
+    }
+
+    fn path_create_directory(
+        &self,
+        _dirfd: types::Fd,
+        _path: &GuestPtr<'_, str>
+    ) -> WasiResult<()> {
+        todo!()
+        //let required_rights = HandleRights::from_base(
+        //    types::Rights::PATH_OPEN | types::Rights::PATH_CREATE_DIRECTORY,
+        //);
+        //let entry = self.get_entry(dirfd)?;
+        //let path = path.as_str()?;
+        //let (dirfd, path) = path::get(
+        //    &entry,
+        //    &required_rights,
+        //    types::Lookupflags::empty(),
+        //    path.deref(),
+        //    false,
+        //)?;
+        //dirfd.create_directory(&path)
+    }
+
+    fn path_filestat_get(
+        &self,
+        _dirfd: types::Fd,
+        _flags: types::Lookupflags,
+        _path: &GuestPtr<'_, str>,
+    ) -> WasiResult<types::Filestat> {
+        todo!()
+        //let required_rights = HandleRights::from_base(types::Rights::PATH_FILESTAT_GET);
+        //let entry = self.get_entry(dirfd)?;
+        //let path = path.as_str()?;
+        //let (dirfd, path) = path::get(&entry, &required_rights, flags, path.deref(), false)?;
+        //let host_filestat =
+        //    dirfd.filestat_get_at(&path, flags.contains(&types::Lookupflags::SYMLINK_FOLLOW))?;
+        //Ok(host_filestat)
+    }
+
+    fn path_filestat_set_times(
+        &self,
+        _dirfd: types::Fd,
+        _flags: types::Lookupflags,
+        _path: &GuestPtr<'_, str>,
+        _atim: types::Timestamp,
+        _mtim: types::Timestamp,
+        _fst_flags: types::Fstflags,
+    ) -> WasiResult<()> {
+        todo!()
+        //let required_rights = HandleRights::from_base(types::Rights::PATH_FILESTAT_SET_TIMES);
+        //let entry = self.get_entry(dirfd)?;
+        //let path = path.as_str()?;
+        //let (dirfd, path) = path::get(&entry, &required_rights, flags, path.deref(), false)?;
+        //dirfd.filestat_set_times_at(
+        //    &path,
+        //    atim,
+        //    mtim,
+        //    fst_flags,
+        //    flags.contains(&types::Lookupflags::SYMLINK_FOLLOW),
+        //)?;
+        //Ok(())
+    }
+
+    fn path_link(
+        &self,
+        _old_fd: types::Fd,
+        _old_flags: types::Lookupflags,
+        _old_path: &GuestPtr<'_, str>,
+        _new_fd: types::Fd,
+        _new_path: &GuestPtr<'_, str>,
+    ) -> WasiResult<()> {
+        todo!()
+        //let required_rights = HandleRights::from_base(types::Rights::PATH_LINK_SOURCE);
+        //let old_entry = self.get_entry(old_fd)?;
+        //let (old_dirfd, old_path) = {
+        //    // Borrow old_path for just this scope
+        //    let old_path = old_path.as_str()?;
+        //    path::get(
+        //        &old_entry,
+        //        &required_rights,
+        //        types::Lookupflags::empty(),
+        //        old_path.deref(),
+        //        false,
+        //    )?
+        //};
+        //let required_rights = HandleRights::from_base(types::Rights::PATH_LINK_TARGET);
+        //let new_entry = self.get_entry(new_fd)?;
+        //let (new_dirfd, new_path) = {
+        //    // Borrow new_path for just this scope
+        //    let new_path = new_path.as_str()?;
+        //    path::get(
+        //        &new_entry,
+        //        &required_rights,
+        //        types::Lookupflags::empty(),
+        //        new_path.deref(),
+        //        false,
+        //    )?
+        //};
+        //old_dirfd.link(
+        //    &old_path,
+        //    new_dirfd,
+        //    &new_path,
+        //    old_flags.contains(&types::Lookupflags::SYMLINK_FOLLOW),
+        //)
+    }
+
+    fn path_open(
+        &self,
+        dirfd: types::Fd,
+        dirflags: types::Lookupflags,
+        path: &GuestPtr<'_, str>,
+        oflags: types::Oflags,
+        _fs_rights_base: types::Rights,
+        _fs_rights_inheriting: types::Rights,
+        fdflags: types::Fdflags,
+    ) -> WasiResult<types::Fd> {
+        println!("{}", dirflags);
+        if dirflags != types::Lookupflags::SYMLINK_FOLLOW {
+            unimplemented!()
+        }
+        if oflags != types::Oflags::empty() {
+            unimplemented!()
+        }
+        if fdflags != types::Fdflags::empty() {
+            unimplemented!()
+        }
+        let path_slice = path.as_bytes();
+        // TODO: probably pretty slow
+        let path_bytes = path_slice.iter().map(|b| b.and_then(|b| b.read())).collect::<Result<Vec<_>, _>>()?;
+        let mut fs = self.fs();
+        let (dir_ino, _) = fs.fds.get(&dirfd).unwrap();
+        let path_ino = *fs.children.get(dir_ino).unwrap().get(&path_bytes).ok_or(mywasi::Error::Noent)?;
+        Ok(fs.new_fd(path_ino))
+    }
+
+    fn path_readlink(
+        &self,
+        _dirfd: types::Fd,
+        _path: &GuestPtr<'_, str>,
+        _buf: &GuestPtr<u8>,
+        _buf_len: types::Size,
+    ) -> WasiResult<types::Size> {
+        todo!()
+        //let required_rights = HandleRights::from_base(types::Rights::PATH_READLINK);
+        //let entry = self.get_entry(dirfd)?;
+        //let (dirfd, path) = {
+        //    // borrow path for just this scope
+        //    let path = path.as_str()?;
+        //    path::get(
+        //        &entry,
+        //        &required_rights,
+        //        types::Lookupflags::empty(),
+        //        path.deref(),
+        //        false,
+        //    )?
+        //};
+        //let mut slice = buf.as_array(buf_len).as_slice_mut()?;
+        //let host_bufused = dirfd.readlink(&path, &mut *slice)?.try_into()?;
+        //Ok(host_bufused)
+    }
+
+    fn path_remove_directory(
+        &self,
+        _dirfd: types::Fd,
+        _path: &GuestPtr<'_, str>
+    ) -> WasiResult<()> {
+        unimplemented!("path_remove_directory")
+    }
+
+    fn path_rename(
+        &self,
+        _old_fd: types::Fd,
+        _old_path: &GuestPtr<'_, str>,
+        _new_fd: types::Fd,
+        _new_path: &GuestPtr<'_, str>,
+    ) -> WasiResult<()> {
+        unimplemented!("path_rename")
+    }
+
+    fn path_symlink(
+        &self,
+        _old_path: &GuestPtr<'_, str>,
+        _dirfd: types::Fd,
+        _new_path: &GuestPtr<'_, str>,
+    ) -> WasiResult<()> {
+        unimplemented!("path_symlink")
+    }
+
+    fn path_unlink_file(
+        &self,
+        _dirfd: types::Fd,
+        _path: &GuestPtr<'_, str>
+    ) -> WasiResult<()> {
+        unimplemented!("path_unlink_file")
+    }
+
+    fn poll_oneoff(
+        &self,
+        _in_: &GuestPtr<types::Subscription>,
+        _out: &GuestPtr<types::Event>,
+        _nsubscriptions: types::Size,
+    ) -> WasiResult<types::Size> {
+        unimplemented!("poll_oneoff")
+    }
+
+    fn proc_exit(
+        &self,
+        _rval: types::Exitcode
+    ) -> wiggle::Trap {
+        // proc_exit is special in that it's expected to unwind the stack, which
+        // typically requires runtime-specific logic.
+        unimplemented!("runtimes are expected to override this implementation")
+    }
+
+    fn proc_raise(
+        &self,
+        _sig: types::Signal
+    ) -> WasiResult<()> {
+        unimplemented!("proc_raise")
+    }
+
+    fn sched_yield(&self) -> WasiResult<()> {
+        std::thread::yield_now();
+        Ok(())
+    }
+
+    fn random_get(
+        &self,
+        _buf: &GuestPtr<u8>,
+        _buf_len: types::Size
+    ) -> WasiResult<()> {
+        unimplemented!("random_get")
+    }
+
+    fn sock_recv(
+        &self,
+        _fd: types::Fd,
+        _ri_data: &types::IovecArray<'_>,
+        _ri_flags: types::Riflags,
+    ) -> WasiResult<(types::Size, types::Roflags)> {
+        unimplemented!("sock_recv")
+    }
+
+    fn sock_send(
+        &self,
+        _fd: types::Fd,
+        _si_data: &types::CiovecArray<'_>,
+        _si_flags: types::Siflags,
+    ) -> WasiResult<types::Size> {
+        unimplemented!("sock_send")
+    }
+
+    fn sock_shutdown(
+        &self,
+        _fd: types::Fd,
+        _how: types::Sdflags
+    ) -> WasiResult<()> {
+        unimplemented!("sock_shutdown")
+    }
+}
 
 pub fn test() -> Result<()> {
     println!("doing wasm things");
@@ -115,18 +1027,6 @@ pub fn test() -> Result<()> {
         memory: LazyInit<Memory>,
     }
     #[derive(Clone, WasmerEnv)]
-    struct MyFsEnv {
-        dirfd: __wasi_fd_t,
-        fs: Arc<Mutex<WasiFs>>,
-        #[wasmer(export)]
-        memory: LazyInit<Memory>,
-    }
-    impl MyFsEnv {
-        fn new(fs: WasiFs, dirfd: __wasi_fd_t) -> Self {
-            MyFsEnv { dirfd, fs: Arc::new(Mutex::new(fs)), memory: Default::default() }
-        }
-    }
-    #[derive(Clone, WasmerEnv)]
     struct ScriptEnv {
         script: Vec<u8>,
         script_len: u32,
@@ -134,51 +1034,6 @@ pub fn test() -> Result<()> {
         memory: LazyInit<Memory>,
     }
 
-
-    // Steal these from wasi for minimal consistency
-    fn write_bytes_inner<T: Write>(
-        mut write_loc: T,
-        memory: &Memory,
-        iovs_arr_cell: &[Cell<__wasi_ciovec_t>],
-    ) -> Result<u32, u16> {
-        let mut bytes_written = 0;
-        for iov in iovs_arr_cell {
-            let iov_inner = iov.get();
-            let bytes = iov_inner.buf.deref(memory, 0, iov_inner.buf_len)?;
-            write_loc
-                .write_all(&bytes.iter().map(|b_cell| b_cell.get()).collect::<Vec<u8>>())
-                .map_err(|_| __WASI_EIO)?;
-
-            // TODO: handle failure more accurately
-            bytes_written += iov_inner.buf_len;
-        }
-        Ok(bytes_written)
-    }
-    fn write_bytes<T: Write>(
-        mut write_loc: T,
-        memory: &Memory,
-        iovs_arr_cell: &[Cell<__wasi_ciovec_t>],
-    ) -> Result<u32, u16> {
-        // TODO: limit amount written
-        let result = write_bytes_inner(&mut write_loc, memory, iovs_arr_cell);
-        write_loc.flush().expect("no write!");
-        result
-    }
-    fn read_bytes<T: Read>(
-        mut reader: T,
-        memory: &Memory,
-        iovs_arr_cell: &[Cell<__wasi_iovec_t>],
-    ) -> Result<u32, __wasi_errno_t> {
-        let mut bytes_read = 0;
-        for iov in iovs_arr_cell {
-            let iov_inner = iov.get();
-            let bytes = iov_inner.buf.deref(memory, 0, iov_inner.buf_len)?;
-            let mut raw_bytes: &mut [u8] =
-                unsafe { &mut *(bytes as *const [_] as *mut [_] as *mut [u8]) };
-            bytes_read += reader.read(raw_bytes).map_err(|_| __WASI_EIO)? as u32;
-        }
-        Ok(bytes_read)
-    }
     macro_rules! mytry {
         ($e:expr) => {{
             match $e {
@@ -192,57 +1047,33 @@ pub fn test() -> Result<()> {
     let script_len: u32 = script.len().try_into().expect("script too big");
     let script_env = ScriptEnv { script, script_len, memory: Default::default() };
 
-    const WORKDIR: &[u8] = b"/work";
-    const WORKDIR_FD: u32 = 3;
+    let mut rofs = ROFilesystem::new();
+    let work_ino = rofs.mkdir(rofs.root(), b"work".to_vec());
 
-    #[derive(Debug, Serialize, Deserialize)]
-    struct ROVirtualFile {
-        data: Vec<u8>,
-        pos: u64,
-    }
-    impl ROVirtualFile {
-        fn with_cursor<T>(&mut self, f: impl FnOnce(&mut io::Cursor<&[u8]>) -> T) -> T {
-            let mut cursor = io::Cursor::new(self.data.as_slice());
-            cursor.set_position(self.pos);
-            let ret = f(&mut cursor);
-            self.pos = cursor.position();
-            ret
-        }
-    }
-    #[typetag::serde]
-    impl WasiFile for ROVirtualFile {
-        fn last_accessed(&self) -> __wasi_timestamp_t { 0 }
-        fn last_modified(&self) -> __wasi_timestamp_t { 0 }
-        fn created_time(&self) -> __wasi_timestamp_t { 0 }
-        fn size(&self) -> __wasi_timestamp_t { self.data.len() as u64 }
-        fn set_len(&mut self, new_size: __wasi_filesize_t) -> Result<(), WasiFsError> { Err(WasiFsError::PermissionDenied) }
-        fn unlink(&mut self) -> Result<(), WasiFsError> { Err(WasiFsError::PermissionDenied) }
-        fn bytes_available(&self) -> Result<usize, WasiFsError> { Ok(self.pos as usize - self.data.len()) }
-    }
-    impl io::Seek for ROVirtualFile {
-        fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> { self.with_cursor(|data| data.seek(pos)) }
-    }
-    impl Read for ROVirtualFile {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { self.with_cursor(|data| data.read(buf)) }
-    }
-    impl Write for ROVirtualFile {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> { Err(io::Error::new(io::ErrorKind::PermissionDenied, "rofile write")) }
-        fn flush(&mut self) -> io::Result<()> { Err(io::Error::new(io::ErrorKind::PermissionDenied, "rofile flush")) }
-    }
-
-    let mut fs = WasiFs::new(&[], &[]).expect("failed to create fs");
-    let dirfd = unsafe {
-        fs.open_dir_all(VIRTUAL_ROOT_FD, "work".to_owned(), ALL_RIGHTS, ALL_RIGHTS, 0).expect("failed to create work dir")
-    };
     for &(mapfrom, mapto) in &[
         ("bs-parity/scripts/main.js", "bs-parity-main.js"),
         ("../beatmaps/7f0356d54ded74ed2dbf56e7290a29fde002c0af/ExpertPlusStandard.dat", "7f0356d54ded74ed2dbf56e7290a29fde002c0af-ExpertPlusStandard.dat"),
     ] {
-        let rofile = ROVirtualFile { data: fs::read(mapfrom).expect("failed to read data"), pos: 0 };
-        fs.open_file_at(dirfd, Box::new(rofile), 0, mapto.to_owned(), ALL_RIGHTS, ALL_RIGHTS, 0).expect("failed to create virtual file");
+        rofs.mkfile(work_ino, mapto.as_bytes().to_owned(), fs::read(mapfrom).expect("failed to read data"));
     }
-    let fsenv = MyFsEnv::new(fs, dirfd);
-    println!("created a virtualfs, /work is at {}", dirfd);
+
+    rofs.calculate_preopens();
+    println!("created a virtualfs with preopens: {:?}", rofs.preopens);
+
+    let wasi_ctx = WasiCtx::new(rofs);
+
+    macro_rules! gen {
+        ($name:ident, $( $arg:ident ),*) => {
+            (
+                ("wasi_snapshot_preview1", stringify!($name)),
+                Function::new_native_with_env(&store, wasi_ctx.clone(), move |env: &WasiCtx, $( $arg ),*| {
+                    println!("wasicall >> {} {:?}", stringify!($name), ($( $arg ),*));
+                    let memory = MemoryWrapper(env.memory_ref().expect("memory not set up"));
+                    mywasi::wasi_snapshot_preview1::$name(env, &memory, $( $arg ),*).expect("wasi call trapped")
+                }).to_export(),
+            )
+        };
+    }
 
     let overrides = vec![
         (
@@ -259,288 +1090,24 @@ pub fn test() -> Result<()> {
                 }
             }).to_export(),
         ),
-        (
-            ("wasi_snapshot_preview1", "args_get"),
-            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, argv: WasmPtr<WasmPtr<u8, Array>, Array>, argv_buf: WasmPtr<u8, Array>| -> __wasi_errno_t {
-                println!("wasi-ish>> args_get");
-                __WASI_ESUCCESS
-            }).to_export(),
-        ),
-        (
-            ("wasi_snapshot_preview1", "args_sizes_get"),
-            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, argc: WasmPtr<u32>, argv_buf_size: WasmPtr<u32>| -> __wasi_errno_t {
-                println!("wasi-ish>> args_sizes_get");
-                let memory = env.memory_ref().expect("memory not set up");
-                let argc = mytry!(argc.deref(memory).ok_or(__WASI_EFAULT));
-                let argv_buf_size = mytry!(argv_buf_size.deref(memory).ok_or(__WASI_EFAULT));
-                argc.set(0);
-                argv_buf_size.set(0);
-                __WASI_ESUCCESS
-            }).to_export(),
-        ),
-        (
-            ("wasi_snapshot_preview1", "clock_time_get"),
-            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, _clock_id: u32, _precision: u64, time: WasmPtr<u64>| -> __wasi_errno_t {
-                println!("wasi-ish>> clock_time_get");
-                let memory = env.memory_ref().expect("memory not set up");
-                let out_addr = mytry!(time.deref(memory).ok_or(__WASI_EFAULT));
-                out_addr.set(0);
-                __WASI_ESUCCESS
-            }).to_export(),
-        ),
-        (
-            ("wasi_snapshot_preview1", "environ_sizes_get"),
-            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, environ_count: WasmPtr<u32>, environ_buf_size: WasmPtr<u32>| -> __wasi_errno_t {
-                println!("wasi-ish>> environ_sizes_get");
-                let memory = env.memory_ref().expect("memory not set up");
-                let environ_count = mytry!(environ_count.deref(memory).ok_or(__WASI_EFAULT));
-                let environ_buf_size = mytry!(environ_buf_size.deref(memory).ok_or(__WASI_EFAULT));
-                environ_count.set(0);
-                environ_buf_size.set(0);
-                __WASI_ESUCCESS
-            }).to_export(),
-        ),
-        // FS related things
-        (
-            ("wasi_snapshot_preview1", "fd_write"),
-            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, fd: __wasi_fd_t, iovs: WasmPtr<__wasi_ciovec_t, Array>, iovs_len: u32, nwritten: WasmPtr<u32>| -> __wasi_errno_t {
-                println!("wasi-ish>> fd_write {}", fd);
-                let memory = env.memory_ref().expect("memory not set up");
-                let iovs = mytry!(iovs.deref(memory, 0, iovs_len).ok_or(__WASI_EFAULT));
-                let nwritten = mytry!(nwritten.deref(memory).ok_or(__WASI_EFAULT));
-                let count = mytry!(match fd {
-                    __WASI_STDOUT_FILENO => write_bytes(io::stdout().lock(), &memory, iovs),
-                    __WASI_STDERR_FILENO => write_bytes(io::stderr().lock(), &memory, iovs),
-                    _ => return __WASI_EINVAL,
-                });
-                nwritten.set(count);
-                __WASI_ESUCCESS
-            }).to_export(),
-        ),
-        (
-            ("wasi_snapshot_preview1", "fd_read"),
-            Function::new_native_with_env(&store, fsenv.clone(), move |env: &MyFsEnv, fd: __wasi_fd_t, iovs: WasmPtr<__wasi_iovec_t, Array>, iovs_len: u32, nread: WasmPtr<u32>| -> __wasi_errno_t {
-                println!("wasi-ish>> fd_read {}", fd);
-                let memory = env.memory_ref().expect("memory not set up");
-                let mut fs = env.fs.lock().unwrap();
-                let iovs = mytry!(iovs.deref(memory, 0, iovs_len).ok_or(__WASI_EFAULT));
-                let nread = mytry!(nread.deref(memory).ok_or(__WASI_EFAULT));
-                let count = match fd {
-                    __WASI_STDOUT_FILENO => return __WASI_EINVAL,
-                    __WASI_STDERR_FILENO => return __WASI_EINVAL,
-                    __WASI_STDIN_FILENO => return __WASI_EINVAL,
-                    _ => {
-                        let fd_entry = mytry!(fs.fd_map.get_mut(&fd).ok_or(__WASI_EBADF));
-                        let offset = fd_entry.offset as usize;
-                        let inode_idx = fd_entry.inode;
-                        let inode = &mut fs.inodes[inode_idx];
 
-                        let bytes_read = match &mut inode.kind {
-                            wasmer_wasi::Kind::File { handle, .. } => {
-                                if let Some(handle) = handle {
-                                    handle.seek(std::io::SeekFrom::Start(offset as u64)).expect("no seek!");
-                                    mytry!(read_bytes(handle, memory, iovs))
-                                } else {
-                                    return __WASI_EINVAL;
-                                }
-                            }
-                            wasmer_wasi::Kind::Dir { .. } | wasmer_wasi::Kind::Root { .. } => return __WASI_EISDIR,
-                            wasmer_wasi::Kind::Symlink { .. } => unimplemented!("Symlinks in wasi::fd_read"),
-                            wasmer_wasi::Kind::Buffer { buffer } => {
-                                mytry!(read_bytes(&buffer[offset..], memory, iovs))
-                            }
-                        };
+        // WASI
+        gen!(args_get, argv, argv_buf),
+        gen!(args_sizes_get, argc, argv_buf_size),
+        gen!(clock_time_get, clock_id, precision, time),
+        gen!(environ_sizes_get, environ_count, environ_buf_size),
 
-                        // reborrow
-                        let fd_entry = mytry!(fs.fd_map.get_mut(&fd).ok_or(__WASI_EBADF));
-                        fd_entry.offset += bytes_read as u64;
-
-                        bytes_read
-                    },
-                };
-                nread.set(count);
-                __WASI_ESUCCESS
-            }).to_export(),
-        ),
-        (
-            ("wasi_snapshot_preview1", "fd_fdstat_get"),
-            Function::new_native_with_env(&store, fsenv.clone(), move |env: &MyFsEnv, fd: __wasi_fd_t, fdstat: WasmPtr<__wasi_fdstat_t>| -> __wasi_errno_t {
-                println!("wasi-ish>> fd_fdstat_get {}", fd);
-                let memory = env.memory_ref().expect("memory not set up");
-                let fdstat = mytry!(fdstat.deref(memory).ok_or(__WASI_EFAULT));
-                fdstat.set(match fd {
-                    WORKDIR_FD => {
-                        __wasi_fdstat_t {
-                            fs_filetype: __WASI_FILETYPE_DIRECTORY,
-                            fs_flags: 0,
-                            fs_rights_base: ALL_RIGHTS,
-                            fs_rights_inheriting: ALL_RIGHTS,
-                        }
-                    },
-                    fd => mytry!(env.fs.lock().unwrap().fdstat(fd)),
-                });
-                __WASI_ESUCCESS
-            }).to_export(),
-        ),
-        (
-            ("wasi_snapshot_preview1", "path_open"),
-            Function::new_native_with_env(&store, fsenv.clone(), move |env: &MyFsEnv, dirfd: __wasi_fd_t, dirflags: __wasi_lookupflags_t, path: WasmPtr<u8, Array>, path_len: u32, o_flags: __wasi_oflags_t, fs_rights_base: __wasi_rights_t, fs_rights_inheriting: __wasi_rights_t, fs_flags: __wasi_fdflags_t, fd: WasmPtr<__wasi_fd_t>| -> __wasi_errno_t {
-                println!("wasi-ish>> path_open");
-
-                let memory = env.memory_ref().expect("memory not set up");
-                let path = mytry!(unsafe { path.get_utf8_str(memory, path_len) }.ok_or(__WASI_EINVAL));
-                println!("wasi-ish>> path_open deets {} -> {}", dirfd, path);
-                let fd = mytry!(fd.deref(memory).ok_or(__WASI_EFAULT));
-
-                match dirfd {
-                    WORKDIR_FD => {
-                        let mut fs = env.fs.lock().unwrap();
-                        // Note the use of env.dirfd - we map our fixed fd to the fd in the virtual fs
-                        let ino = mytry!(fs.get_inode_at_path(env.dirfd, path, dirflags & __WASI_LOOKUP_SYMLINK_FOLLOW != 0));
-                        let newfd = mytry!(fs.create_fd(fs_rights_base, fs_rights_inheriting, fs_flags, 0, ino));
-                        fd.set(newfd)
-                    },
-                    _ => return __WASI_EACCES,
-                }
-                __WASI_ESUCCESS
-            }).to_export(),
-        ),
-        (
-            ("wasi_snapshot_preview1", "fd_close"),
-            Function::new_native_with_env(&store, fsenv.clone(), move |env: &MyFsEnv, fd: __wasi_fd_t| -> __wasi_errno_t {
-                println!("wasi-ish>> fd_close");
-                let mut fs = env.fs.lock().unwrap();
-                mytry!(fs.close_fd(fd));
-                __WASI_ESUCCESS
-            }).to_export(),
-        ),
-        (
-            ("wasi_snapshot_preview1", "fd_seek"),
-            Function::new_native_with_env(&store, fsenv.clone(), move |env: &MyFsEnv, fd: __wasi_fd_t, offset: __wasi_filedelta_t, whence: __wasi_whence_t, newoffset: WasmPtr<__wasi_filesize_t>| -> __wasi_errno_t {
-                println!("wasi-ish>> fd_seek {}", fd);
-                let memory = env.memory_ref().expect("memory not set up");
-                let newoffset = mytry!(newoffset.deref(memory).ok_or(__WASI_EFAULT));
-                let mut fs = env.fs.lock().unwrap();
-                let fd_entry = mytry!(fs.fd_map.get_mut(&fd).ok_or(__WASI_EBADF));
-                match whence {
-                    __WASI_WHENCE_CUR => fd_entry.offset = (fd_entry.offset as i64 + offset) as u64,
-                    __WASI_WHENCE_END => {
-                        let inode_idx = fd_entry.inode;
-                        match fs.inodes[inode_idx].kind {
-                            wasmer_wasi::Kind::File { ref mut handle, .. } => {
-                                if let Some(handle) = handle {
-                                    let end = mytry!(handle.seek(io::SeekFrom::End(0)).ok().ok_or(__WASI_EIO));
-                                    // TODO: handle case if fd_entry.offset uses 64 bits of a u64
-
-                                    // reborrow
-                                    let fd_entry = mytry!(fs.fd_map.get_mut(&fd).ok_or(__WASI_EBADF));
-                                    fd_entry.offset = (end as i64 + offset) as u64;
-                                } else {
-                                    return __WASI_EINVAL;
-                                }
-                            }
-                            wasmer_wasi::Kind::Symlink { .. } => {
-                                unimplemented!("wasi::fd_seek not implemented for symlinks")
-                            }
-                            wasmer_wasi::Kind::Dir { .. } | wasmer_wasi::Kind::Root { .. } => {
-                                // TODO: check this
-                                return __WASI_EINVAL;
-                            }
-                            wasmer_wasi::Kind::Buffer { .. } => {
-                                // seeking buffers probably makes sense
-                                // TODO: implement this
-                                return __WASI_EINVAL;
-                            }
-                        }
-                    }
-                    __WASI_WHENCE_SET => fd_entry.offset = offset as u64,
-                    _ => return __WASI_EINVAL,
-                }
-                // reborrow
-                let fd_entry = mytry!(fs.fd_map.get_mut(&fd).ok_or(__WASI_EBADF));
-                newoffset.set(fd_entry.offset);
-                __WASI_ESUCCESS
-            }).to_export(),
-        ),
-        // Preopen handling
-        // https://github.com/WebAssembly/wasi-libc/blob/5b148b6131f36770f110c24d61adfb1e17fea06a/libc-bottom-half/sources/preopens.c#L201
-        (
-            ("wasi_snapshot_preview1", "fd_prestat_dir_name"),
-            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, fd: __wasi_fd_t, path: WasmPtr<u8, Array>, path_len: u32| -> __wasi_errno_t {
-                println!("wasi-ish>> fd_prestat_dir_name {}", fd);
-                match fd {
-                    WORKDIR_FD => {
-                        assert_eq!(path_len as usize, WORKDIR.len());
-                        let memory = env.memory_ref().expect("memory not set up");
-                        let path = mytry!(path.deref(memory, 0, path_len).ok_or(__WASI_EFAULT));
-                        for (cell, &b) in path.into_iter().zip(WORKDIR.iter()) {
-                            cell.set(b)
-                        }
-                    },
-                    _ => return __WASI_EBADF,
-                }
-                __WASI_ESUCCESS
-            }).to_export(),
-        ),
-        (
-            ("wasi_snapshot_preview1", "fd_prestat_get"),
-            Function::new_native_with_env(&store, MyEnv::default(), move |env: &MyEnv, fd: __wasi_fd_t, prestat: WasmPtr<__wasi_prestat_t>| -> __wasi_errno_t {
-                println!("wasi-ish>> fd_prestat_get {}", fd);
-                match fd {
-                    WORKDIR_FD => {
-                        let memory = env.memory_ref().expect("memory not set up");
-                        let prestat = mytry!(prestat.deref(memory).ok_or(__WASI_EFAULT));
-                        prestat.set(__wasi_prestat_t {
-                            pr_type: __WASI_PREOPENTYPE_DIR,
-                            u: __wasi_prestat_u {
-                                dir: __wasi_prestat_u_dir_t {
-                                    pr_name_len: WORKDIR.len().try_into().expect("workdir too long"),
-                                },
-                            },
-                        })
-                    },
-                    _ => return __WASI_EBADF,
-                }
-                __WASI_ESUCCESS
-            }).to_export(),
-        ),
+        gen!(path_open, dirfd, dirflags, path_ptr, path_len, o_flags, fs_rights_base, fs_rights_inheriting, fs_flags, fd),
+        gen!(fd_prestat_get, fd, buf_ptr),
+        gen!(fd_prestat_dir_name, fd, path, path_len),
+        gen!(fd_fdstat_get, fd, stat_ptr),
+        gen!(fd_write, fd, iovs_ptr, iovs_len, nwritten_ptr),
+        gen!(fd_seek, fd, offset, whence, newoffset_ptr),
+        gen!(fd_read, fd, iovs_ptr, iovs_len, nread_ptr),
+        gen!(fd_close, fd),
     ].into_iter().collect();
+
     let importobj = FakeResolver::new(&store, module.imports(), &overrides);
-
-    //let fake_namespace: Exports = module.imports()
-    //    .filter(|import| import.module() == "env")
-    //    .map(|import| {
-    //        let ty: &ExternType = import.ty();
-    //        let ex = match ty {
-    //            ExternType::Function(ft) => {
-    //                let path = format!("{}:{}", import.module(), import.name());
-    //                let errfn = move |_vals: &[Val]| -> Result<Vec<Val>, RuntimeError> {
-    //                    Err(RuntimeError::new(path.clone()))
-    //                };
-    //                let f = Function::new(&store, ft, errfn);
-    //                f.into()
-    //            },
-    //            other => {
-    //                todo!("unable to shim {:?}", other)
-    //            },
-    //        };
-    //        (import.name().to_owned(), ex)
-    //    })
-    //    .collect();
-
-    //let wasi_state = WasiState::new("testy")
-    //    .args(&["--std", "--script", "/plugintest.js"])
-    //    .preopen_dir("/tmp")?
-    //    //.preopen_dir("/home/aidanhs/Desktop/per/bsaber/bsmeta")?
-    //    .build()?;
-    //let wasi_env = WasiEnv::new(wasi_state);
-    //let wasi_vsn = wasmer_wasi::get_wasi_version(&module, false).unwrap();
-    //let mut importobj = wasmer_wasi::generate_import_object_from_env(&store, wasi_env, wasi_vsn);
-    //println!("wasi generated importobj");
-    //for (path, _export) in importobj.clone() {
-    //    println!("{:?}", path)
-    //}
-    //importobj.register("env", fake_namespace);
 
     let instance = Instance::new(&module, &importobj)?;
 

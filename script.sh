@@ -11,6 +11,16 @@ if [ "$1" = sync ]; then
         ./target/release/bsmeta ./.env ./bsmeta-empty.db ../songsdata.json ./progress.py \
         "$1":~/work/bsmeta/
 
+elif [ "$1" = build ]; then
+    WASI_ROOT=$(pwd)/wasmtime/crates/wasi-common/WASI cargo build --release
+
+elif [ "$1" = doc ]; then
+    WASI_ROOT=$(pwd)/wasmtime/crates/wasi-common/WASI cargo doc --release --open
+
+elif [ "$1" = run ]; then
+    shift
+    RUST_BACKTRACE=1 WASI_ROOT=$(pwd)/wasmtime/crates/wasi-common/WASI cargo run --release -- "$@"
+
 elif [ "$1" = buildplugins ]; then
     cd quickjs
 
