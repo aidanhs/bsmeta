@@ -37,16 +37,6 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
     return ret;
 }
 
-uint32_t get_script_size();
-void get_script_data(char *);
-
-const char *get_script() {
-    uint32_t script_size = get_script_size();
-    char *script_data = malloc(script_size);
-    get_script_data(script_data);
-    return script_data;
-}
-
 uint8_t do_analysis() {
     JSRuntime *rt;
     JSContext *ctx;
@@ -77,11 +67,17 @@ uint8_t do_analysis() {
     ret = eval_buf(ctx, base, strlen(base), "<input>", JS_EVAL_TYPE_MODULE);
     if (ret != 0) { return ret; }
 
-    //const char *buf = "console.log('hello aidan youre awesome');";
-    const char *buf = get_script();
-    int buf_len = strlen(buf);
+    const char *filename = "/work/script.js";
+    size_t buf_len;
+    uint8_t *buf = js_load_file(ctx, &buf_len, filename);
+    if (!buf) {
+        perror(filename);
+        exit(1);
+    }
 
-    ret = eval_buf(ctx, buf, strlen(buf), "<input>", JS_EVAL_TYPE_MODULE);
+    ret = eval_buf(ctx, buf, buf_len, "<input>", JS_EVAL_TYPE_MODULE);
+    js_free(ctx, buf);
+
     if (ret != 0) { return ret; }
 
     return 0;

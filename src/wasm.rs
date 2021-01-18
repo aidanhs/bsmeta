@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
-use wasmer::{Array, WasmPtr, LazyInit, Memory, Store, WasmerEnv, Cranelift, JIT, Export, Exportable, Val, ExternType, Function, ImportType, Resolver, Module, Instance, RuntimeError};
+use wasmer::{LazyInit, Memory, Store, WasmerEnv, Cranelift, JIT, Export, Exportable, Val, ExternType, Function, ImportType, Resolver, Module, Instance, RuntimeError};
 use wasmer_wasi::types::{
     __WASI_STDIN_FILENO,
     __WASI_STDOUT_FILENO,
@@ -1028,31 +1028,11 @@ pub fn test() -> Result<()> {
     let module = load_module().context("failed to load module")?;
     let store = module.store();
 
-    #[derive(Clone, WasmerEnv)]
-    struct ScriptEnv {
-        script: Vec<u8>,
-        script_len: u32,
-        #[wasmer(export)]
-        memory: LazyInit<Memory>,
-    }
-
-    macro_rules! mytry {
-        ($e:expr) => {{
-            match $e {
-                Ok(v) => v,
-                Err(e) => return e,
-            }
-        }};
-    }
-
-    let script = fs::read("plugintest.js").expect("failed to open plugin");
-    let script_len: u32 = script.len().try_into().expect("script too big");
-    let script_env = ScriptEnv { script, script_len, memory: Default::default() };
-
     let mut rofs = ROFilesystem::new();
     let work_ino = rofs.mkdir(rofs.root(), b"work".to_vec());
 
     for &(mapfrom, mapto) in &[
+        ("plugintest.js", "script.js"),
         ("bs-parity/scripts/main.js", "bs-parity-main.js"),
         ("../beatmaps/7f0356d54ded74ed2dbf56e7290a29fde002c0af/ExpertPlusStandard.dat", "7f0356d54ded74ed2dbf56e7290a29fde002c0af-ExpertPlusStandard.dat"),
     ] {
@@ -1078,21 +1058,6 @@ pub fn test() -> Result<()> {
     }
 
     let overrides = vec![
-        (
-            ("env", "get_script_size"),
-            Function::new_native_with_env(&store, script_len, move |&script_len_env: &u32| -> u32 { script_len_env }).to_export(),
-        ),
-        (
-            ("env", "get_script_data"),
-            Function::new_native_with_env(&store, script_env, move |env: &ScriptEnv, data: WasmPtr<u8, Array>| -> () {
-                let memory = env.memory_ref().expect("memory not set up");
-                let data = mytry!(data.deref(memory, 0, env.script_len).ok_or(()));
-                for (cell, &b) in data.into_iter().zip(env.script.iter()) {
-                    cell.set(b)
-                }
-            }).to_export(),
-        ),
-
         // WASI
         gen!(args_get, argv, argv_buf),
         gen!(args_sizes_get, argc, argv_buf_size),
