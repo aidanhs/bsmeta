@@ -9,6 +9,14 @@ table! {
 }
 
 table! {
+    tSongAnalysis (key, analysis_name) {
+        key -> Integer,
+        analysis_name -> Text,
+        result -> Binary,
+    }
+}
+
+table! {
     tSongData (key) {
         key -> Integer,
         zipdata -> Binary,
@@ -17,9 +25,11 @@ table! {
     }
 }
 
+joinable!(tSongAnalysis -> tSong (key));
 joinable!(tSongData -> tSong (key));
 
 allow_tables_to_appear_in_same_query!(
     tSong,
+    tSongAnalysis,
     tSongData,
 );

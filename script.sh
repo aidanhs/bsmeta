@@ -8,8 +8,11 @@ if [ "$1" = sync ]; then
     shift
     cargo build --release
     rsync -avrz --progress --partial \
-        ./target/release/bsmeta ./.env ./bsmeta-empty.db ../songsdata.json ./progress.py \
+        ./target/release/bsmeta ./.env \
         "$1":~/work/bsmeta/
+    rsync -avrz --progress --partial \
+        ./plugins/dist/ \
+        "$1":~/work/bsmeta/plugins/dist/
 
 elif [ "$1" = build ]; then
     WASI_ROOT=$(pwd)/wasmtime/crates/wasi-common/WASI cargo build --release

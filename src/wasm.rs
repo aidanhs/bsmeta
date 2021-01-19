@@ -1093,18 +1093,45 @@ fn run_plugin(module: Module, mut plugin: tar::Archive<impl Read>, map_dat: Vec<
     }
 }
 
+pub struct AnalysisPlugin {
+    module: Module,
+    tar_data: Vec<u8>,
+    name: String,
+}
+
+impl AnalysisPlugin {
+    pub fn run(&self, map_dat: Vec<u8>) -> Result<Box<serde_json::value::RawValue>> {
+        let ar = tar::Archive::new(&*self.tar_data);
+        run_plugin(self.module.clone(), ar, map_dat)
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+pub fn load_plugin(plugin_name: &str, interp: &str) -> Result<AnalysisPlugin> {
+    let interp_path = format!("plugins/dist/{}.wasm", interp);
+    let module = load_module(interp_path).with_context(|| format!("failed to load interp module {}", interp))?;
+    let plugin_path = format!("plugins/dist/{}.tar", plugin_name);
+    let tar_data = fs::read(&plugin_path).with_context(|| format!("failed to read {}", plugin_path))?;
+    Ok(AnalysisPlugin {
+        module,
+        tar_data,
+        name: plugin_name.to_owned(),
+    })
+}
+
 pub fn test() -> Result<()> {
-    let module = load_module("plugins/dist/js.wasm").context("failed to load module")?;
+    let plugin = load_plugin("parity", "js")?;
+
     for map_dat_path in &[
         "../beatmaps/7f0356d54ded74ed2dbf56e7290a29fde002c0af/ExpertPlusStandard.dat",
         "../beatmaps/9a1d001995cc0a2014352aa7148cbcbf2e489d89/Hard.dat",
         "../beatmaps/28c746c1bbdaa7f10e894b5054c2e80a647ef1f6/ExpertPlusStandard.dat",
     ] {
         info!("considering {}", map_dat_path);
-        let ar = tar::Archive::new(fs::File::open("plugins/dist/parity.tar").context("failed to open plugin tar")?);
-        let map_dat = fs::read(map_dat_path)?;
-        let ret = run_plugin(module.clone(), ar, map_dat)?;
-        println!("output: {}", ret.get())
+        let ret = plugin.run(fs::read(map_dat_path)?)?;
+        info!("output: {}", ret.get())
     }
     Ok(())
 }

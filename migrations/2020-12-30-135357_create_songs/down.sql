@@ -2,3 +2,4 @@
 
 DROP TABLE tSongData;
 DROP TABLE tSong;
+DROP TABLE tSongAnalysis;
