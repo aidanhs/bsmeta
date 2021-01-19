@@ -198,9 +198,8 @@ fn analyse_songs() {
             }
             info!("Performing analysis {} on {}", plugin.name(), key_str);
             let data: Vec<u8> = {
-                use schema::tSongData::dsl::*;
-                tSongData.select(data)
-                    .find(key)
+                schema::tSongData::table.find(key)
+                    .select(schema::tSongData::data)
                     .get_result(conn)
                     .expect("failed to load zipdata")
             };
