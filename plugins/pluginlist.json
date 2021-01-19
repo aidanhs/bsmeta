@@ -1,0 +1,9 @@
+{
+    "parity": {
+        "interp": "js",
+        "files": {
+            "plugin-parity.js": "script.js",
+            "bs-parity/scripts/main.js": "bs-parity-main.js"
+        }
+    }
+}

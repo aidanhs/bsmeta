@@ -24,5 +24,13 @@ CREATE TABLE tSongData (
     data       BLOB                NOT NULL CHECK (typeof(data) = 'blob'),
     -- My derived extra meta
     extra_meta BLOB                NOT NULL CHECK (typeof(extra_meta) = 'blob'),
-    FOREIGN KEY(key) REFERENCES tSong(key)
+    FOREIGN KEY (key) REFERENCES tSong(key)
+);
+
+CREATE TABLE tSongAnalysis (
+    key           INTEGER NOT NULL CHECK (typeof(key) = 'integer'),
+    analysis_name TEXT    NOT NULL CHECK (typeof(analysis_name) = 'text'),
+    result        BLOB NOT NULL    CHECK (typeof(result) = 'blob'),
+    PRIMARY KEY (key, analysis_name),
+    FOREIGN KEY (key) REFERENCES tSong(key)
 );

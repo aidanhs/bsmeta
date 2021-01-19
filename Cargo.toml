@@ -12,10 +12,24 @@ chrono = "0.4"
 decorum = "0.3"
 diesel = { version = "1.4.5", features = ["sqlite"] }
 dotenv = "0.15.0"
+env_logger = "0.8"
 lewton = "0.10"
+log = "0.4"
 reqwest = { version = "0.10", features = ["blocking", "brotli", "gzip"] }
 #rusqlite = "0.24"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 tar = "0.4"
+typetag = "0.1"
 zip = "0.5"
+
+wasi-common = { path = "wasmtime/crates/wasi-common" }
+wiggle = { path = "wasmtime/crates/wiggle" }
+wiggle-borrow = { path = "wasmtime/crates/wiggle/borrow" }
+
+wasmer = "1"
+wasmer-wasi = "1"
+
+[profile.release]
+debug = 1
+overflow-checks = true

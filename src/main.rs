@@ -9,8 +9,9 @@ use decorum::R32;
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use dotenv::dotenv;
+use log::info;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::env;
 use std::fs;
@@ -23,6 +24,7 @@ use std::time;
 mod scripts;
 #[allow(non_snake_case)]
 mod schema;
+mod wasm;
 mod models {
     use decorum::R32;
     use diesel::backend::Backend;
@@ -103,6 +105,7 @@ const DL_PAUSE: time::Duration = time::Duration::from_secs(10);
 const RATELIMIT_PADDING: time::Duration = time::Duration::from_secs(60);
 
 fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("bsmeta=info,warn")).init();
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         panic!("wrong num of args")
@@ -118,6 +121,7 @@ fn main() {
         "dl" => dl_data(),
         "dlmeta" => dl_meta(),
         "analyse" => analyse_songs(),
+        "test" => test().unwrap(),
         a => panic!("unknown arg {}", a),
     }
 }
@@ -129,6 +133,10 @@ fn key_to_num<T: AsRef<str>>(k: &T) -> i32 {
 fn num_to_key(n: i32) -> String {
     assert!(n >= 0);
     format!("{:x}", n)
+}
+
+fn test() -> Result<()> {
+    wasm::test()
 }
 
 fn unknown_songs() -> Vec<i32> {
@@ -159,26 +167,116 @@ fn analyse_songs() {
     println!("Analysing songs");
     let conn = &establish_connection();
 
-    let to_analyse: Vec<(Song, SongData)> = {
+    let to_analyse: Vec<i32> = {
         use schema::tSong::dsl::*;
         use schema::tSongData::dsl::*;
         tSong
-            .inner_join(tSongData)
+            .select(schema::tSong::key)
             .filter(deleted.eq(false))
+            .inner_join(tSongData)
             .load(conn).expect("failed to select keys")
     };
 
-    for (_song, songdata) in to_analyse {
-        let mut tar = tar::Archive::new(&*songdata.data);
-        let mut names_lens = vec![];
-        for entry in tar.entries().expect("couldn't iterate over entries") {
-            let entry = entry.expect("error getting entry");
-            let path = entry.path().expect("couldn't get path");
-            let path_str = path.to_str().expect("couldn't convert path");
-            names_lens.push((path_str.to_owned(), entry.size()))
+    // TODO: load from plugins list
+    let analyses = &[
+        wasm::load_plugin("parity", "js").expect("failed to load parity plugin"),
+    ];
+
+    let num_to_analyse = to_analyse.len();
+    for (i, key) in to_analyse.into_iter().enumerate() {
+        let key_str = num_to_key(key);
+        info!("Considering song {}/{}: {}", i+1, num_to_analyse, key_str);
+        for plugin in analyses {
+            let exists: bool = {
+                use schema::tSongAnalysis::dsl::*;
+                diesel::select(diesel::dsl::exists(
+                    tSongAnalysis.filter(key.eq(key)).filter(analysis_name.eq(plugin.name()))
+                )).get_result(conn).expect("failed to check if analysis exists")
+            };
+            if exists {
+                continue
+            }
+            info!("Performing analysis {} on {}", plugin.name(), key_str);
+            let data: Vec<u8> = {
+                use schema::tSongData::dsl::*;
+                tSongData.select(data)
+                    .find(key)
+                    .get_result(conn)
+                    .expect("failed to load zipdata")
+            };
+
+            #[derive(Deserialize)]
+            struct InfoDat {
+                #[serde(rename = "_difficultyBeatmapSets")]
+                difficulty_beatmap_sets: Vec<DifficultySet>,
+            }
+            #[derive(Deserialize)]
+            struct DifficultySet {
+                #[serde(rename = "_difficultyBeatmaps")]
+                difficulty_beatmaps: Vec<DifficultyBeatmap>,
+            }
+            #[derive(Deserialize)]
+            struct DifficultyBeatmap {
+                #[serde(rename = "_beatmapFilename")]
+                beatmap_filename: String,
+            }
+
+            let mut map_dats: Option<HashSet<String>> = None;
+            let mut ar = tar::Archive::new(&*data);
+            let mut datas = HashMap::new();
+            for entry in ar.entries().expect("failed to parse dat tar") {
+                let mut entry = entry.expect("failed to decode dat entry");
+                let path_bytes = entry.path_bytes();
+                let path = str::from_utf8(&path_bytes).unwrap();
+                let lower_path = path.to_lowercase();
+                if lower_path == "info.dat" {
+                    let info: InfoDat = serde_json::from_reader(entry).unwrap();
+                    map_dats = Some(info.difficulty_beatmap_sets.into_iter()
+                        .flat_map(|ds| ds.difficulty_beatmaps)
+                        .map(|db| db.beatmap_filename)
+                        .collect())
+                } else {
+                    let mut v = vec![];
+                    let path = path.to_owned();
+                    entry.read_to_end(&mut v).unwrap();
+                    assert!(datas.insert(path, v).is_none())
+                }
+            }
+
+            let map_dats = map_dats.unwrap();
+            info!("Identified {} maps to analyse", map_dats.len());
+            for (name, data) in datas {
+                if !map_dats.contains(&name) {
+                    continue
+                }
+                // TODO
+                let _ = plugin.run(data);
+            }
+            info!("Analysis complete");
         }
-        println!("{:?}", names_lens);
     }
+
+    // TODO: loads all zipdata into memory
+    //let to_analyse: Vec<(Song, SongData)> = {
+    //    use schema::tSong::dsl::*;
+    //    use schema::tSongData::dsl::*;
+    //    tSong
+    //        .inner_join(tSongData)
+    //        .filter(deleted.eq(false))
+    //        .load(conn).expect("failed to select keys")
+    //};
+
+    //for (_song, songdata) in to_analyse {
+    //    let mut tar = tar::Archive::new(&*songdata.data);
+    //    let mut names_lens = vec![];
+    //    for entry in tar.entries().expect("couldn't iterate over entries") {
+    //        let entry = entry.expect("error getting entry");
+    //        let path = entry.path().expect("couldn't get path");
+    //        let path_str = path.to_str().expect("couldn't convert path");
+    //        names_lens.push((path_str.to_owned(), entry.size()))
+    //    }
+    //    println!("{:?}", names_lens);
+    //}
 }
 
 fn make_client() -> reqwest::blocking::Client {
