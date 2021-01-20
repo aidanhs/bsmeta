@@ -9,7 +9,7 @@ use decorum::R32;
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use dotenv::dotenv;
-use log::info;
+use log::{info, warn};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
@@ -248,8 +248,19 @@ fn analyse_songs() {
                 if !map_dats.contains(&name) {
                     continue
                 }
-                // TODO
-                let _ = plugin.run(data);
+                let results = match plugin.run(data) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("Failed to run analysis: {}", e);
+                        continue
+                    },
+                };
+                // Prefix results with plugin
+                let results: HashMap<_, _> = results
+                    .into_iter()
+                    .map(|(k, v)| (format!("{}-{}", name, k), v))
+                    .collect();
+                let _ = results;
             }
             info!("Analysis complete");
         }

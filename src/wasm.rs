@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use log::{trace, debug, info, warn};
+use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs;
@@ -1018,7 +1019,7 @@ fn load_module(path: impl AsRef<Path>) -> Result<wasmer::Module> {
     Ok(module)
 }
 
-fn run_plugin(module: Module, mut plugin: tar::Archive<impl Read>, map_dat: Vec<u8>) -> Result<Box<serde_json::value::RawValue>> {
+fn run_plugin(module: Module, mut plugin: tar::Archive<impl Read>, map_dat: Vec<u8>) -> Result<HashMap<String, AnalysisValue>> {
     let store = module.store();
 
     let mut rofs = ROFilesystem::new();
@@ -1099,8 +1100,16 @@ pub struct AnalysisPlugin {
     name: String,
 }
 
+#[derive(Debug)]
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AnalysisValue {
+    String(String),
+    Number(serde_json::Number),
+}
+
 impl AnalysisPlugin {
-    pub fn run(&self, map_dat: Vec<u8>) -> Result<Box<serde_json::value::RawValue>> {
+    pub fn run(&self, map_dat: Vec<u8>) -> Result<HashMap<String, AnalysisValue>> {
         let ar = tar::Archive::new(&*self.tar_data);
         run_plugin(self.module.clone(), ar, map_dat)
     }
@@ -1131,7 +1140,7 @@ pub fn test() -> Result<()> {
     ] {
         info!("considering {}", map_dat_path);
         let ret = plugin.run(fs::read(map_dat_path)?)?;
-        info!("output: {}", ret.get())
+        info!("output: {:?} {}", ret, serde_json::to_string(&ret).unwrap())
     }
     Ok(())
 }
