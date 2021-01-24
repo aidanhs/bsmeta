@@ -519,7 +519,7 @@ fn get_song_zip(client: &reqwest::blocking::Client, key_str: &str, hash: &str) -
 
 fn get_latest_maps(client: &reqwest::blocking::Client, page: usize) -> Result<BeatSaverLatestResponse> {
     println!("Getting maps from page {}", page);
-    let (res, headers) = do_req(client, &format!("https://beatsaver.com/api/maps/latest/{}", page))?;
+    let (res, headers) = do_req(client, &format!("https://beatsaver.com/api/maps/latest/{}?automapper=1", page))?;
     println!("Got response {}", res.status());
 
     if res.status() == reqwest::StatusCode::NOT_FOUND {
