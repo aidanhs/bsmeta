@@ -67,10 +67,9 @@ mod models {
     #[derive(FromSqlRow, AsExpression)]
     #[sql_type = "Binary"]
     pub struct ExtraMeta {
-        pub song_duration: R32,
-        pub song_size: u32,
+        pub song_duration: Option<R32>,
+        pub song_size: Option<u32>,
         pub zip_size: u32,
-        pub zip_files: Vec<String>,
     }
 
     impl<DB> ToSql<Binary, DB> for ExtraMeta
@@ -98,6 +97,24 @@ mod models {
 
 use models::*;
 
+#[derive(Deserialize)]
+struct InfoDat {
+    #[serde(rename = "_songFilename")]
+    song_filename: String,
+    #[serde(rename = "_difficultyBeatmapSets")]
+    difficulty_beatmap_sets: Vec<DifficultySet>,
+}
+#[derive(Deserialize)]
+struct DifficultySet {
+    #[serde(rename = "_difficultyBeatmaps")]
+    difficulty_beatmaps: Vec<DifficultyBeatmap>,
+}
+#[derive(Deserialize)]
+struct DifficultyBeatmap {
+    #[serde(rename = "_beatmapFilename")]
+    beatmap_filename: String,
+}
+
 const INFO_PAUSE: time::Duration = time::Duration::from_secs(3);
 const DL_PAUSE: time::Duration = time::Duration::from_secs(10);
 
@@ -114,6 +131,7 @@ fn main() {
         "script-loadjson" => scripts::loadjson(),
         "script-checkdeleted" => scripts::checkdeleted(),
         "script-getmissingbsmeta" => scripts::getmissingbsmeta(),
+        "script-regenzipderived" => scripts::regenzipderived(),
         "unknown" => {
             println!("Considering unknown keys");
             println!("Unknown keys: {:?}", unknown_songs().len());
@@ -203,22 +221,6 @@ fn analyse_songs() {
                     .get_result(conn)
                     .expect("failed to load zipdata")
             };
-
-            #[derive(Deserialize)]
-            struct InfoDat {
-                #[serde(rename = "_difficultyBeatmapSets")]
-                difficulty_beatmap_sets: Vec<DifficultySet>,
-            }
-            #[derive(Deserialize)]
-            struct DifficultySet {
-                #[serde(rename = "_difficultyBeatmaps")]
-                difficulty_beatmaps: Vec<DifficultyBeatmap>,
-            }
-            #[derive(Deserialize)]
-            struct DifficultyBeatmap {
-                #[serde(rename = "_beatmapFilename")]
-                beatmap_filename: String,
-            }
 
             let mut map_dats: Option<HashSet<String>> = None;
             let mut ar = tar::Archive::new(&*data);
@@ -598,57 +600,85 @@ fn ratelimit_pause(headers: &reqwest::header::HeaderMap) -> Result<time::Duratio
     Ok(2*time::Duration::from_millis(r) + RATELIMIT_PADDING) // pad for safety
 }
 
-const IMAGE_EXTS: &[&str] = &[".jpg", ".jpeg", ".png"];
-const OGG_EXTS: &[&str] = &[".egg"];
 
 fn zip_to_dats_tar(zipdata: &[u8]) -> Result<(Vec<u8>, ExtraMeta)> {
     let zipreader = io::Cursor::new(zipdata);
+
+    let mut infodat: Option<(String, InfoDat)> = None;
     let mut zip = zip::ZipArchive::new(zipreader).expect("failed to load zip");
-    let mut dat_names: Vec<String> = vec![];
-    let mut all_names: Vec<String> = vec![];
     for zip_index in 0..zip.len() {
         let entry = zip.by_index(zip_index).context("failed to get entry from zip")?;
         let name_bytes = entry.name_raw();
-        let name = str::from_utf8(name_bytes).context("failed to interpret name as utf8")?;
-        if !name.is_ascii() {
-            bail!("non-ascii name in zip: {}", name)
-        } else if entry.is_dir() || name.contains("/") || name.contains("\\") {
-            bail!("dir entry in zip: {}", name)
-        }
-
-        all_names.push(name.to_owned());
-        let lower_name = name.to_lowercase();
-        if lower_name.ends_with(".dat") {
-            dat_names.push(name.to_owned())
-        } else if !(IMAGE_EXTS.into_iter().chain(OGG_EXTS).any(|ext| lower_name.ends_with(ext))) {
-            bail!("odd file in zip: {}", name)
+        if name_bytes.eq_ignore_ascii_case(b"info.dat") {
+            if infodat.is_some() {
+                bail!("multiple info.dat candidates")
+            }
+            infodat = Some((
+                String::from_utf8(name_bytes.to_owned()).expect("info.dat name not ascii"),
+                serde_json::from_reader(entry).context("failed to parse info.dat")?,
+            ));
+            break
         }
     }
-    println!("Got dat names: {:?}, all names: {:?}", dat_names, all_names);
+
+    let (infodat_name, infodat) = infodat.ok_or_else(|| anyhow!("no info.dat found in zip"))?;
+    let mut dat_names: Vec<_> = infodat.difficulty_beatmap_sets.into_iter()
+        .flat_map(|ds| ds.difficulty_beatmaps)
+        .map(|db| db.beatmap_filename)
+        .collect();
+    // Put info.dat at the front, sort and dedup the rest
+    dat_names.sort();
+    dat_names.dedup();
+    dat_names.reverse();
+    dat_names.push(infodat_name);
+    dat_names.reverse();
+
+    println!("Got dat names: {:?}", dat_names);
 
     let mut tar = tar::Builder::new(vec![]);
     for dat_name in dat_names {
-        let dat = zip.by_name(&dat_name).expect("failed to get dat name out of zip");
+        if !dat_name.is_ascii() {
+            bail!("non-ascii dat name")
+        }
+
+        let mut dat = None;
+        // This nested loop isn't ideal, but `by_name` take a str and we want to avoid decoding as utf8
+        for zip_index in 0..zip.len() {
+            let mut entry = zip.by_index(zip_index).context("failed to get candidate dat entry from zip")?;
+            if entry.name_raw() == dat_name.as_bytes() {
+                if dat.is_some() {
+                    bail!("duplicate entry for dat")
+                }
+                let mut data = vec![];
+                entry.read_to_end(&mut data).context("failed to read dat from zip")?;
+                dat = Some(data)
+            }
+        }
+        let dat = dat.ok_or_else(|| anyhow!("failed to get dat out of zip"))?;
+
         let mut header = tar::Header::new_old();
         header.set_path(dat_name).expect("failed to set path");
         header.set_entry_type(tar::EntryType::Regular);
-        header.set_size(dat.size());
+        header.set_size(dat.len().try_into().expect("dat length conversion failed"));
         header.set_cksum();
-        tar.append(&header, dat).expect("failed to append data to tar");
+        tar.append(&header, &*dat).expect("failed to append data to tar");
     }
     let tardata = tar.into_inner().expect("failed to finish tar");
 
-    let ogg_names: Vec<_> = all_names.iter().filter(|name| OGG_EXTS.into_iter().any(|ext| name.to_lowercase().ends_with(ext))).collect();
-    if ogg_names.len() != 1 {
-        bail!("multiple oggs: {:?}", ogg_names)
-    }
-    let ogg_name = ogg_names[0].to_owned();
-    let mut oggdata = vec![];
-    zip.by_name(&ogg_name).expect("failed to find ogg").read_to_end(&mut oggdata).expect("failed to read ogg");
-    let song_duration = ogg_duration(&oggdata)?;
-    let song_size = oggdata.len().try_into().expect("song size too big");
+    let ogg_name = infodat.song_filename;
+    let (song_duration, song_size) = match zip.by_name(&ogg_name) {
+        Ok(mut entry) => {
+            let mut oggdata = vec![];
+            entry.read_to_end(&mut oggdata).context("failed to read ogg")?;
+            let song_duration = ogg_duration(&oggdata)?;
+            let song_size = oggdata.len().try_into().expect("song size too big");
+            (Some(song_duration), Some(song_size))
+        },
+        Err(zip::result::ZipError::FileNotFound) => (None, None),
+        Err(e) => bail!(anyhow!(e).context("failed trying to find ogg in zip")),
+    };
     let zip_size = zipdata.len().try_into().expect("zip size too big");
-    let extra_meta = ExtraMeta { song_duration, song_size, zip_size, zip_files: all_names };
+    let extra_meta = ExtraMeta { song_duration, song_size, zip_size };
 
     Ok((tardata, extra_meta))
 }

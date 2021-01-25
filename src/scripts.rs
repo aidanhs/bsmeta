@@ -133,3 +133,38 @@ pub fn getmissingbsmeta() {
         thread::sleep(INFO_PAUSE)
     }
 }
+
+/// Regenerate all extrameta and infodats
+pub fn regenzipderived() {
+    use super::zip_to_dats_tar;
+
+    let conn = &super::establish_connection();
+
+    println!("Finding all song data");
+    let needs_regenerating: Vec<i32> = {
+        schema::tSongData::table
+            .select(schema::tSongData::key)
+            .load(conn).expect("failed to select keys")
+    };
+
+    let num_to_regenerate = needs_regenerating.len();
+    println!("Regenerating data for {} songs", num_to_regenerate);
+    for (i, key) in needs_regenerating.into_iter().enumerate() {
+        let key_str = num_to_key(key);
+        println!("Regenerating derived data for {} ({}/{})", key_str, i+1, num_to_regenerate);
+        let zip: Vec<u8> = {
+            schema::tSongData::table.find(key)
+                .select(schema::tSongData::zipdata)
+                .get_result(conn)
+                .expect("failed to load zipdata")
+        };
+        let (newdata, new_extra_meta) = zip_to_dats_tar(&zip).expect("failed to reprocess zip");
+        diesel::update(schema::tSongData::table.find(key))
+            .set((
+                schema::tSongData::data.eq(newdata),
+                schema::tSongData::extra_meta.eq(new_extra_meta),
+            ))
+            .execute(conn)
+            .expect("error saving data");
+    }
+}
