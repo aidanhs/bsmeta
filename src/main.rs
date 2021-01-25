@@ -387,7 +387,7 @@ fn dl_data() {
             .load(conn).expect("failed to select keys")
     };
     let mut to_download: Vec<Song> = to_download.into_iter().map(|(s, _sd)| s).collect();
-    println!("Got {} to download", to_download.len());
+    println!("Got {} not yet downloaded", to_download.len());
     to_download.sort_by_key(|s| s.key);
     to_download.reverse();
 
@@ -402,15 +402,23 @@ fn dl_data() {
     }
 
     let mut blacklisted_keys = load_blacklist();
+    println!("Got {} blacklisted_keys", blacklisted_keys.len());
+
+    let to_download: Vec<_> = to_download.into_iter()
+        .filter(|s| !blacklisted_keys.contains_key(&num_to_key(s.key)))
+        .collect();
+    let num_to_download = to_download.len();
+    println!("Got {} to try and download", num_to_download);
+
     let client = &make_client();
-    for song in to_download {
+    for (i, song) in to_download.into_iter().enumerate() {
         let key_str = num_to_key(song.key);
         let hash = song.hash.expect("non-null hash was None");
+        println!("Considering song {} ({}/{})", key_str, i+1, num_to_download);
         if let Some(reason) = blacklisted_keys.get(&key_str) {
-            println!("Skipping song {} - previous failure: {}", song.key, reason);
+            println!("Skipping song {} - previous failure: {}", key_str, reason);
             continue
         }
-        println!("Considering song {}", song.key);
         println!("Getting song zip for {} {}", song.key, hash);
         let zipdata = match get_song_zip(client, &key_str, &hash) {
             Ok(zd) => zd,
@@ -420,7 +428,7 @@ fn dl_data() {
                 continue
             },
         };
-        println!("Converting zip for {} to dats tar", song.key);
+        println!("Converting zip for {} to dats tar", key_str);
         let (tardata, extra_meta) = match zip_to_dats_tar(&zipdata) {
             Ok((td, em)) => (td, em),
             Err(e) => {
@@ -430,7 +438,7 @@ fn dl_data() {
             },
         };
         set_song_data(conn, song.key, tardata, extra_meta, zipdata);
-        println!("Finished getting song {}", song.key);
+        println!("Finished getting song {}", key_str);
         thread::sleep(DL_PAUSE);
     }
 }
