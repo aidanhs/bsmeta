@@ -665,22 +665,31 @@ fn zip_to_dats_tar(zipdata: &[u8]) -> Result<(Vec<u8>, ExtraMeta)> {
     }
     let tardata = tar.into_inner().expect("failed to finish tar");
 
-    let ogg_name = infodat.song_filename;
-    let (song_duration, song_size) = match zip.by_name(&ogg_name) {
-        Ok(mut entry) => {
-            let mut oggdata = vec![];
-            entry.read_to_end(&mut oggdata).context("failed to read ogg")?;
-            let song_duration = ogg_duration(&oggdata)?;
-            let song_size = oggdata.len().try_into().expect("song size too big");
-            (Some(song_duration), Some(song_size))
-        },
-        Err(zip::result::ZipError::FileNotFound) => (None, None),
-        Err(e) => bail!(anyhow!(e).context("failed trying to find ogg in zip")),
-    };
+    let (song_duration, song_size) = ogg_duration_from_zip(&infodat.song_filename, zip);
     let zip_size = zipdata.len().try_into().expect("zip size too big");
     let extra_meta = ExtraMeta { song_duration, song_size, zip_size };
 
     Ok((tardata, extra_meta))
+}
+
+fn ogg_duration_from_zip(ogg_name: &str, mut zip: zip::ZipArchive<impl Read + io::Seek>) -> (Option<R32>, Option<u32>) {
+    macro_rules! try_return {
+        ($e:expr, $r:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("error getting ogg size and/or duration: {}", e);
+                    return $r
+                },
+            }
+        };
+    }
+    let mut entry = try_return!(zip.by_name(&ogg_name), (None, None));
+    let mut oggdata = vec![];
+    try_return!(entry.read_to_end(&mut oggdata), (None, None));
+    let song_size = Some(oggdata.len().try_into().expect("song size too big"));
+    let song_duration = Some(try_return!(ogg_duration(&oggdata), (None, song_size)));
+    (song_duration, song_size)
 }
 
 fn ogg_duration(ogg: &[u8]) -> Result<R32> {
