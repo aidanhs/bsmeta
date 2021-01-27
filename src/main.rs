@@ -1,3 +1,4 @@
+#![feature(duration_saturating_ops, duration_zero)]
 #![recursion_limit="256"]
 
 #[macro_use]
@@ -115,8 +116,16 @@ struct DifficultyBeatmap {
     beatmap_filename: String,
 }
 
+#[derive(Deserialize)]
+struct BeatSaverMap {
+    key: String,
+    hash: String,
+    uploaded: String,
+}
+
 const INFO_PAUSE: time::Duration = time::Duration::from_secs(3);
-const DL_PAUSE: time::Duration = time::Duration::from_secs(10);
+const BSABER_DL_PAUSE: time::Duration = time::Duration::from_secs(10);
+const BEATSAVER_DL_PAUSE: time::Duration = time::Duration::from_secs(120);
 
 // Additional padding to apply when ratelimited, to prove we're being a good citizen
 const RATELIMIT_PADDING: time::Duration = time::Duration::from_secs(60);
@@ -340,7 +349,7 @@ fn dl_latest_meta(conn: &SqliteConnection, client: &reqwest::blocking::Client) {
 
     println!("Upserting {} map metas", maps.len());
     // Deliberately go oldest first, so if there's an error we can resume
-    while let Some((BeatSaverMap { key, hash }, raw_meta)) = maps.pop() {
+    while let Some((BeatSaverMap { key, hash, uploaded: _ }, raw_meta)) = maps.pop() {
         println!("Upserting {}", key);
         upsert_song(conn, key_to_num(&key), Some(hash), false, Some(raw_meta))
     }
@@ -361,7 +370,7 @@ fn dl_unknown_meta(conn: &SqliteConnection, client: &reqwest::blocking::Client) 
             continue
         }
         println!("Getting meta for song {} ({}/{})", key_str, i+1, num_unknown);
-        match get_map(client, key).expect("failed to get map for song") {
+        match get_map_meta(client, key).expect("failed to get map for song") {
             Some((m, raw)) => {
                 assert_eq!(m.key, key_str);
                 upsert_song(conn, key, Some(m.hash), false, Some(raw.get().as_bytes().to_owned()))
@@ -413,6 +422,8 @@ fn dl_data() {
     println!("Got {} to try and download", num_to_download);
 
     let client = &make_client();
+    let mut last_bsaber_dl = time::Instant::now();
+    let mut last_beatsaver_dl = time::Instant::now();
     for (i, song) in to_download.into_iter().enumerate() {
         let key_str = num_to_key(song.key);
         let hash = song.hash.expect("non-null hash was None");
@@ -421,8 +432,17 @@ fn dl_data() {
             println!("Skipping song {} - previous failure: {}", key_str, reason);
             continue
         }
+        // Skip recent songs to give bsaber.org a chance to cache, to spread out our downloads off
+        // beatsaver
+        let bsmeta = song.bsmeta.as_ref().expect("no bsmeta available in song");
+        let bsm: BeatSaverMap = serde_json::from_slice(bsmeta).expect("failed to parse bsmeta");
+        let uploaded = chrono::DateTime::parse_from_rfc3339(&bsm.uploaded).expect("failed to parse bsmeta uploaded");
+        if chrono::Utc::now().signed_duration_since(uploaded).num_days() < 1 {
+            println!("Skipping song - uploaded within last 24 hours");
+            continue
+        }
         println!("Getting song zip for {} {}", song.key, hash);
-        let zipdata = match get_song_zip(client, &key_str, &hash) {
+        let zipdata = match get_song_zip(client, &key_str, &hash, &mut last_bsaber_dl, &mut last_beatsaver_dl) {
             Ok(zd) => zd,
             Err(e) => {
                 blacklisted_keys.insert(key_str.clone(), format!("get song zip failed: {}", e));
@@ -440,8 +460,7 @@ fn dl_data() {
             },
         };
         set_song_data(conn, song.key, tardata, extra_meta, zipdata);
-        println!("Finished getting song {}", key_str);
-        thread::sleep(DL_PAUSE);
+        println!("Finished getting song {}", key_str)
     }
 }
 
@@ -465,11 +484,6 @@ struct BeatSaverLatestResponse {
     #[serde(deserialize_with = "splitde")]
     docs: Vec<(BeatSaverMap, Box<serde_json::value::RawValue>)>,
 }
-#[derive(Deserialize)]
-struct BeatSaverMap {
-    key: String,
-    hash: String,
-}
 
 macro_rules! retry {
     ($t:expr, $e:expr) => {{
@@ -481,7 +495,7 @@ macro_rules! retry {
 
 const RATELIMIT_RESET_AFTER_HEADER: &str = "x-ratelimit-reset-after";
 
-fn get_song_zip(client: &reqwest::blocking::Client, key_str: &str, hash: &str) -> Result<Vec<u8>> {
+fn get_song_zip(client: &reqwest::blocking::Client, key_str: &str, hash: &str, last_bsaber_dl: &mut time::Instant, last_beatsaver_dl: &mut time::Instant) -> Result<Vec<u8>> {
     //let url = format!("https://beatsaver.com/cdn/{}/{}.zip", key_str, hash);
     //println!("Retrieving {} from url {}", key_str, url);
     //let mut res = client.get(&url).send().expect("failed to send request");
@@ -496,35 +510,70 @@ fn get_song_zip(client: &reqwest::blocking::Client, key_str: &str, hash: &str) -
     let mut attempts = 2;
     loop {
         if attempts == 0 {
-            panic!("failed to retrieve data")
+            break
         }
         attempts -= 1;
 
-        println!("Retrieving {} from bsaber", key_str);
+        let pause_remaining = BSABER_DL_PAUSE.saturating_sub(last_bsaber_dl.elapsed());
+        if !pause_remaining.is_zero() {
+            thread::sleep(pause_remaining)
+        }
+        *last_bsaber_dl = time::Instant::now();
+        println!("Retrieving {} from bsaber.org", key_str);
         let (res, headers) = match do_req(client, &format!("https://bsaber.org/files/cache/zip/{}.zip", key_str)) {
             Ok(r) => r,
-            Err(e) => retry!(DL_PAUSE, format!("failed to send request: {}", e)),
+            Err(e) => retry!(BSABER_DL_PAUSE, format!("failed to send request: {}", e)),
         };
         println!("Got response {}", res.status());
 
         if res.status() == reqwest::StatusCode::NOT_FOUND {
-            bail!("song not found from bsaber.org")
+            break
         }
         if !res.status().is_success() {
-            retry!(DL_PAUSE, format!("non-success response: {:?} {:?}", headers, res.bytes()))
+            retry!(BSABER_DL_PAUSE, format!("non-success response: {:?} {:?}", headers, res.bytes()))
         }
         let bytes = match res.bytes() {
             Ok(bs) => bs,
-            Err(e) => retry!(DL_PAUSE, format!("failed to get bytes: {}, response headers: {:?}", e, headers)),
+            Err(e) => retry!(BSABER_DL_PAUSE, format!("failed to get bytes: {}, response headers: {:?}", e, headers)),
         };
 
         return Ok(bytes.as_ref().to_owned())
     }
 
-    //println!("Retrieving {} from fs", key_str);
-    //let path = format!("../beatmaps/{}.zip", hash);
-    //let zipdata = fs::read(path).unwrap();
-    //zipdata
+    // TODO: ratelimit pause
+    println!("Falling back to beatsaver.com for song");
+    let mut attempts = 2;
+    loop {
+        if attempts == 0 {
+            bail!("multiple attempts to retrieve failed, from both bsaber.org and beatsaver.com")
+        }
+        attempts -= 1;
+
+        let pause_remaining = BEATSAVER_DL_PAUSE.saturating_sub(last_beatsaver_dl.elapsed());
+        if !pause_remaining.is_zero() {
+            thread::sleep(pause_remaining)
+        }
+        *last_beatsaver_dl = time::Instant::now();
+        println!("Retrieving {} from beatsaver.com", key_str);
+        let (res, headers) = match do_req(client, &format!("https://beatsaver.com/cdn/{}/{}.zip", key_str, hash)) {
+            Ok(r) => r,
+            Err(e) => retry!(BEATSAVER_DL_PAUSE, format!("failed to send request: {}", e)),
+        };
+        println!("Got response {}", res.status());
+
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            bail!("song not found on bsaber.org or beatsaver.com")
+        }
+        if !res.status().is_success() {
+            retry!(BEATSAVER_DL_PAUSE, format!("non-success response: {:?} {:?}", headers, res.bytes()))
+        }
+        let bytes = match res.bytes() {
+            Ok(bs) => bs,
+            Err(e) => retry!(BEATSAVER_DL_PAUSE, format!("failed to get bytes: {}, response headers: {:?}", e, headers)),
+        };
+
+        return Ok(bytes.as_ref().to_owned())
+    }
 }
 
 fn get_latest_maps(client: &reqwest::blocking::Client, page: usize) -> Result<BeatSaverLatestResponse> {
@@ -549,7 +598,7 @@ fn get_latest_maps(client: &reqwest::blocking::Client, page: usize) -> Result<Be
     Ok(res)
 }
 
-fn get_map(client: &reqwest::blocking::Client, key: i32) -> Result<Option<(BeatSaverMap, Box<serde_json::value::RawValue>)>> {
+fn get_map_meta(client: &reqwest::blocking::Client, key: i32) -> Result<Option<(BeatSaverMap, Box<serde_json::value::RawValue>)>> {
     let mut did_ratelimit = false;
 
     loop {

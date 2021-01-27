@@ -83,7 +83,7 @@ pub fn checkdeleted() {
         if deleteds.contains_key(&key_str) {
             continue
         }
-        let is_deleted = super::get_map(client, key).expect("failed to get map detail").is_none();
+        let is_deleted = super::get_map_meta(client, key).expect("failed to get map detail").is_none();
         assert!(deleteds.insert(key_str, is_deleted).is_none());
         save_deleteds(&deleteds);
 
@@ -117,7 +117,7 @@ pub fn getmissingbsmeta() {
         println!("Considering song {} ({}/{})", key_str, i+1, num_to_update);
 
         assert!(song.bsmeta.is_none());
-        match super::get_map(client, song.key).expect("failed to get map detail") {
+        match super::get_map_meta(client, song.key).expect("failed to get map detail") {
             Some((m, raw)) => {
                 assert_eq!(m.key, key_str);
                 if let Some(hash) = song.hash {
