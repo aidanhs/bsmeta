@@ -1,16 +1,16 @@
 /// This file is for on-off scripts that will not be used regularly
-use diesel::prelude::*;
+use async_std::task;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::io::BufReader;
 use std::thread;
-
+use sqlx::prelude::*;
+use sqlx::{query, query_as};
 
 use super::INFO_PAUSE;
 use super::models::*;
-use super::schema;
 use super::{key_to_num, num_to_key};
 
 #[derive(Deserialize)]
@@ -50,7 +50,6 @@ pub fn loadjson() {
     }
 }
 
-
 /// Validate that every song marked as deleted, is in fact deleted
 pub fn checkdeleted() {
     let conn = &super::establish_connection();
@@ -68,13 +67,10 @@ pub fn checkdeleted() {
 
     println!("Loading all deleted songs from db");
     let mut deleteds = load_deleteds();
-    let currently_deleted: Vec<i32> = {
-        use schema::tSong::dsl::*;
-        tSong
-            .select(key)
-            .filter(deleted.eq(true))
-            .load(conn).expect("failed to select keys")
-    };
+    let currently_deleted = task::block_on(
+        query!("SELECT key FROM tSong WHERE deleted = true").fetch_all(conn)
+    ).expect("failed to select keys");
+    let currently_deleted: Vec<_> = currently_deleted.into_iter().map(|res| res.key).collect();
     let num_to_check = currently_deleted.len();
     println!("Checking {} deleted songs", num_to_check);
     for (i, key) in currently_deleted.into_iter().enumerate() {
@@ -91,9 +87,9 @@ pub fn checkdeleted() {
     }
 
     let needs_undeleting: Vec<_> = deleteds.into_iter().filter_map(|(k, deleted)| if !deleted { Some(k) } else { None }).collect();
-    let needs_undeleting_i32s: Vec<_> = needs_undeleting.iter().map(key_to_num).collect();
+    let needs_undeleting_i64s: Vec<_> = needs_undeleting.iter().map(key_to_num).collect();
     println!("The following keys are marked as deleted but need undeleting: {:?}", needs_undeleting);
-    println!("(as integers: {:?})", needs_undeleting_i32s);
+    println!("(as integers: {:?})", needs_undeleting_i64s);
 }
 
 /// For any song without a bsmeta and that isn't deleted, update it with one or the other
@@ -102,13 +98,10 @@ pub fn getmissingbsmeta() {
     let client = &super::make_client();
 
     println!("Loading all songs with missing meta from DB");
-    let missing_meta: Vec<Song> = {
-        use schema::tSong::dsl::*;
-        tSong
-            .filter(deleted.eq(false))
-            .filter(bsmeta.is_null())
-            .load(conn).expect("failed to select keys")
-    };
+    let missing_meta = task::block_on(
+        query_as!(Song, "SELECT * FROM tSong WHERE deleted = false AND bsmeta IS NULL")
+            .fetch_all(conn)
+    ).expect("failed to select songs");
 
     let num_to_update = missing_meta.len();
     println!("Updating {} songs with missing meta", num_to_update);
@@ -141,30 +134,23 @@ pub fn regenzipderived() {
     let conn = &super::establish_connection();
 
     println!("Finding all song data");
-    let needs_regenerating: Vec<i32> = {
-        schema::tSongData::table
-            .select(schema::tSongData::key)
-            .load(conn).expect("failed to select keys")
-    };
+    let needs_regenerating = task::block_on(query!("SELECT key FROM tSongData").fetch_all(conn)).expect("failed to select keys");
+    let needs_regenerating: Vec<_> = needs_regenerating.into_iter().map(|res| res.key).collect();
 
     let num_to_regenerate = needs_regenerating.len();
     println!("Regenerating data for {} songs", num_to_regenerate);
     for (i, key) in needs_regenerating.into_iter().enumerate() {
         let key_str = num_to_key(key);
         println!("Regenerating derived data for {} ({}/{})", key_str, i+1, num_to_regenerate);
-        let zip: Vec<u8> = {
-            schema::tSongData::table.find(key)
-                .select(schema::tSongData::zipdata)
-                .get_result(conn)
-                .expect("failed to load zipdata")
-        };
+        let zip = task::block_on(
+            query!("SELECT zipdata FROM tSongData WHERE key = ?", key).fetch_one(conn)
+        ).expect("failed to load zipdata").zipdata;
         let (newdata, new_extra_meta) = zip_to_dats_tar(&zip).expect("failed to reprocess zip");
-        diesel::update(schema::tSongData::table.find(key))
-            .set((
-                schema::tSongData::data.eq(newdata),
-                schema::tSongData::extra_meta.eq(new_extra_meta),
-            ))
-            .execute(conn)
-            .expect("error saving data");
+        let res = task::block_on(query!("
+            UPDATE tSongData
+            SET data = ?, extra_meta = ?
+            WHERE key = ?
+        ", newdata, new_extra_meta, key).execute(conn)).expect("error saving data");
+        assert_eq!(res.rows_affected(), 1, "insert {}", key)
     }
 }

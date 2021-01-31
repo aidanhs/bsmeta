@@ -1,14 +1,10 @@
 #![feature(duration_saturating_ops, duration_zero)]
 #![recursion_limit="256"]
 
-#[macro_use]
-extern crate diesel;
-
 use anyhow::{Context, Result, anyhow, bail};
+use async_std::task;
 use chrono::Utc;
 use decorum::R32;
-use diesel::prelude::*;
-use diesel::sqlite::SqliteConnection;
 use dotenv::dotenv;
 use log::{info, warn};
 use serde::Deserialize;
@@ -21,43 +17,31 @@ use std::path::Path;
 use std::str;
 use std::thread;
 use std::time;
+use sqlx::prelude::*;
+use sqlx::{query, query_as};
+
+type SqliteConnection = sqlx::sqlite::SqlitePool;
 
 mod scripts;
-#[allow(non_snake_case)]
-mod schema;
 mod wasm;
 mod models {
     use decorum::R32;
-    use diesel::backend::Backend;
-    use diesel::serialize::{self, Output, ToSql};
-    use diesel::deserialize::{self, FromSql};
-    use diesel::sql_types::Binary;
     use serde::{Deserialize, Serialize};
-    use std::io::Write;
-    use super::schema::{tSong, tSongData};
 
-    #[derive(AsChangeset, Identifiable, Insertable, Queryable)]
     #[derive(Debug, Eq, PartialEq)]
-    #[primary_key(key)]
-    #[table_name="tSong"]
-    #[changeset_options(treat_none_as_null="true")]
     pub struct Song {
         // TODO: make this u32
-        pub key: i32,
+        pub key: i64,
         pub hash: Option<String>,
         pub tstamp: i64,
         pub deleted: bool,
         pub bsmeta: Option<Vec<u8>>,
     }
 
-    #[derive(AsChangeset, Identifiable, Insertable, Queryable)]
     #[derive(Debug, Eq, PartialEq)]
-    #[primary_key(key)]
-    #[table_name="tSongData"]
-    #[changeset_options(treat_none_as_null="true")]
     pub struct SongData {
         // TODO: make this u32
-        pub key: i32,
+        pub key: i64,
         pub zipdata: Vec<u8>,
         pub data: Vec<u8>,
         pub extra_meta: ExtraMeta,
@@ -65,33 +49,35 @@ mod models {
 
     #[derive(Debug, Eq, PartialEq)]
     #[derive(Serialize, Deserialize)]
-    #[derive(FromSqlRow, AsExpression)]
-    #[sql_type = "Binary"]
     pub struct ExtraMeta {
         pub song_duration: Option<R32>,
         pub song_size: Option<u32>,
         pub zip_size: u32,
     }
 
-    impl<DB> ToSql<Binary, DB> for ExtraMeta
-    where
-        DB: Backend,
-        Vec<u8>: ToSql<Binary, DB>
+    impl<DB: sqlx::Database> sqlx::Type<DB> for ExtraMeta
+        where
+            Vec<u8>: sqlx::Type<DB>
     {
-        fn to_sql<W: Write>(&self, out: &mut Output<W, DB>) -> serialize::Result {
-            let bytes = serde_json::to_vec(&self).expect("failed to serialize extrameta");
-            bytes.to_sql(out)
+        fn type_info() -> <DB as sqlx::Database>::TypeInfo {
+            <Vec<u8> as sqlx::Type<DB>>::type_info()
+        }
+        fn compatible(ty: &<DB as sqlx::Database>::TypeInfo) -> bool {
+            <Vec<u8> as sqlx::Type<DB>>::compatible(ty)
         }
     }
 
-    impl<DB> FromSql<Binary, DB> for ExtraMeta
+    impl<'q, DB: sqlx::Database> sqlx::Encode<'q, DB> for ExtraMeta
     where
-        DB: Backend,
-        Vec<u8>: FromSql<Binary, DB>,
+        Vec<u8>: sqlx::Encode<'q, DB>
     {
-        fn from_sql(bytes: Option<&DB::RawValue>) -> deserialize::Result<Self> {
-            let bs = Vec::<u8>::from_sql(bytes)?;
-            Ok(serde_json::from_slice(&bs).expect("failed to deserialize extrameta"))
+        fn encode_by_ref(&self, buf: &mut <DB as sqlx::database::HasArguments<'q>>::ArgumentBuffer) -> sqlx::encode::IsNull {
+            let bytes = serde_json::to_vec(&self).expect("failed to serialize extrameta");
+            <Vec<u8> as sqlx::Encode<'q, DB>>::encode_by_ref(&bytes, buf)
+        }
+        fn encode(self, buf: &mut <DB as sqlx::database::HasArguments<'q>>::ArgumentBuffer) -> sqlx::encode::IsNull {
+            let bytes = serde_json::to_vec(&self).expect("failed to serialize extrameta");
+            <Vec<u8> as sqlx::Encode<'q, DB>>::encode(bytes, buf)
         }
     }
 }
@@ -132,6 +118,8 @@ const RATELIMIT_PADDING: time::Duration = time::Duration::from_secs(60);
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("bsmeta=info,warn")).init();
+    env::set_var("ASYNC_STD_THREAD_COUNT", "3");
+
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         panic!("wrong num of args")
@@ -153,24 +141,24 @@ fn main() {
     }
 }
 
-fn key_to_num<T: AsRef<str>>(k: &T) -> i32 {
-    u32::from_str_radix(k.as_ref(), 16).expect("can't parse key").try_into().expect("too big for i32")
+fn key_to_num<T: AsRef<str>>(k: &T) -> i64 {
+    u32::from_str_radix(k.as_ref(), 16).expect("can't parse key").into()
 }
 
-fn num_to_key(n: i32) -> String {
+fn num_to_key(n: i64) -> String {
     assert!(n >= 0);
-    format!("{:x}", n)
+    format!("{:x}", n) // format as hex
 }
 
 fn test() -> Result<()> {
     wasm::test()
 }
 
-fn unknown_songs() -> Vec<i32> {
-    use schema::tSong::dsl::*;
-    let conn = establish_connection();
+fn unknown_songs() -> Vec<i64> {
+    let conn = &establish_connection();
 
-    let mut results: Vec<i32> = tSong.select(key).load(&conn).expect("failed to select keys");
+    let results = task::block_on(query!("SELECT key FROM tSong").fetch_all(conn)).expect("failed to select keys");
+    let mut results: Vec<_> = results.into_iter().map(|res| res.key).collect();
     println!("Loaded keys");
     results.sort();
 
@@ -194,15 +182,10 @@ fn analyse_songs() {
     println!("Analysing songs");
     let conn = &establish_connection();
 
-    let to_analyse: Vec<i32> = {
-        use schema::tSong::dsl::*;
-        use schema::tSongData::dsl::*;
-        tSong
-            .select(schema::tSong::key)
-            .filter(deleted.eq(false))
-            .inner_join(tSongData)
-            .load(conn).expect("failed to select keys")
-    };
+    let to_analyse = task::block_on(
+        query!("SELECT s.key FROM tSong s, tSongData sd WHERE deleted = false AND s.key = sd.key").fetch_all(conn)
+    ).expect("failed to select key");
+    let to_analyse: Vec<_> = to_analyse.into_iter().map(|res| res.key).collect();
 
     // TODO: load from plugins list
     let analyses = &[
@@ -214,22 +197,18 @@ fn analyse_songs() {
         let key_str = num_to_key(key);
         info!("Considering song {}/{}: {}", i+1, num_to_analyse, key_str);
         for plugin in analyses {
-            let exists: bool = {
-                use schema::tSongAnalysis::dsl::*;
-                diesel::select(diesel::dsl::exists(
-                    tSongAnalysis.filter(key.eq(key)).filter(analysis_name.eq(plugin.name()))
-                )).get_result(conn).expect("failed to check if analysis exists")
-            };
+            let plugin_name = plugin.name();
+            let exists: bool = task::block_on(
+                query!("SELECT count(*) as count FROM tSongAnalysis WHERE key = ? AND analysis_name = ?", key, plugin_name)
+                    .fetch_one(conn)
+            ).expect("failed to check if analysis exists").count > 0;
             if exists {
                 continue
             }
             info!("Performing analysis {} on {}", plugin.name(), key_str);
-            let data: Vec<u8> = {
-                schema::tSongData::table.find(key)
-                    .select(schema::tSongData::data)
-                    .get_result(conn)
-                    .expect("failed to load zipdata")
-            };
+            let data = task::block_on(
+                query!("SELECT data FROM tSongData WHERE key = ?", key).fetch_one(conn)
+            ).expect("failed to load zipdata").data;
 
             let mut map_dats: Option<HashSet<String>> = None;
             let mut ar = tar::Archive::new(&*data);
@@ -356,7 +335,7 @@ fn dl_latest_meta(conn: &SqliteConnection, client: &reqwest::blocking::Client) {
 }
 
 // These are keys that beatsaver seems to redirect to another map - I'm not sure why
-const REDIRECTING_KEYS: &[i32] = &[0x9707];
+const REDIRECTING_KEYS: &[i64] = &[0x9707];
 
 fn dl_unknown_meta(conn: &SqliteConnection, client: &reqwest::blocking::Client) {
     println!("Finding song metas to download");
@@ -387,17 +366,14 @@ fn dl_data() {
     let conn = &establish_connection();
 
     println!("Finding songs to download");
-    let to_download: Vec<(Song, Option<SongData>)> = {
-        use schema::tSong::dsl::*;
-        use schema::tSongData::dsl::*;
-        tSong
-            .left_join(tSongData)
-            .filter(schema::tSong::hash.is_not_null())
-            .filter(schema::tSongData::key.is_null())
-            .filter(deleted.eq(false))
-            .load(conn).expect("failed to select keys")
-    };
-    let mut to_download: Vec<Song> = to_download.into_iter().map(|(s, _sd)| s).collect();
+    let mut to_download = task::block_on(
+        query_as!(Song, "
+            SELECT s.*
+            FROM tSong s
+                LEFT OUTER JOIN tSongData sd ON s.key = sd.key
+            WHERE s.hash IS NOT NULL AND s.deleted = false AND sd.key IS NULL
+        ").fetch_all(conn)
+    ).expect("failed to select keys");
     println!("Got {} not yet downloaded", to_download.len());
     to_download.sort_by_key(|s| s.key);
     to_download.reverse();
@@ -598,7 +574,7 @@ fn get_latest_maps(client: &reqwest::blocking::Client, page: usize) -> Result<Be
     Ok(res)
 }
 
-fn get_map_meta(client: &reqwest::blocking::Client, key: i32) -> Result<Option<(BeatSaverMap, Box<serde_json::value::RawValue>)>> {
+fn get_map_meta(client: &reqwest::blocking::Client, key: i64) -> Result<Option<(BeatSaverMap, Box<serde_json::value::RawValue>)>> {
     let mut did_ratelimit = false;
 
     loop {
@@ -759,58 +735,67 @@ fn ogg_duration(ogg: &[u8]) -> Result<R32> {
     Ok(len_play)
 }
 
-fn set_song_data(conn: &SqliteConnection, key: i32, data: Vec<u8>, extra_meta: ExtraMeta, zipdata: Vec<u8>) {
-    let songdata = SongData { key, zipdata, data, extra_meta };
-    let nrows = diesel::insert_into(schema::tSongData::table)
-        .values(&songdata)
-        .execute(conn)
-        .expect("error updating song data");
-    assert_eq!(nrows, 1, "{:?}", songdata)
+// https://github.com/launchbadge/sqlx/issues/328 - for inserting a Song
+fn set_song_data(conn: &SqliteConnection, key: i64, data: Vec<u8>, extra_meta: ExtraMeta, zipdata: Vec<u8>) {
+    let res = task::block_on(
+        query!("INSERT INTO tSongData (key, data, extra_meta, zipdata) VALUES (?, ?, ?, ?)", key, data, extra_meta, zipdata)
+            .execute(conn)
+    ).expect("error updating song data");
+    assert_eq!(res.rows_affected(), 1, "{:?}", (key, data, extra_meta, zipdata))
 }
 
-fn upsert_song(conn: &SqliteConnection, key: i32, hash: Option<String>, deleted: bool, bsmeta: Option<Vec<u8>>) {
-    let new_song = Song { key, hash, tstamp: Utc::now().timestamp_millis(), deleted, bsmeta };
-    let nrows = diesel::replace_into(schema::tSong::table)
-        .values(&new_song)
-        .execute(conn)
-        .expect("error saving song");
-    assert_eq!(nrows, 1, "{}", new_song.key)
+fn upsert_song(conn: &SqliteConnection, key: i64, hash: Option<String>, deleted: bool, bsmeta: Option<Vec<u8>>) {
+    let tstamp = Utc::now().timestamp_millis();
+    let res = task::block_on(
+        query!("
+            INSERT INTO tSong (key, hash, tstamp, deleted, bsmeta) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (key) DO UPDATE SET hash=excluded.hash, tstamp=excluded.tstamp, deleted=excluded.deleted, bsmeta=excluded.bsmeta
+        ", key, hash, tstamp, deleted, bsmeta)
+            .execute(conn)
+    ).expect("error upserting song");
+    assert_eq!(res.rows_affected(), 1, "upsert {}", key)
 }
 
-fn insert_song(conn: &SqliteConnection, key: i32, hash: Option<String>, deleted: bool, bsmeta: Option<Vec<u8>>) {
-    let new_song = Song { key, hash, tstamp: Utc::now().timestamp_millis(), deleted, bsmeta };
-    let nrows = diesel::insert_into(schema::tSong::table)
-        .values(&new_song)
-        .execute(conn)
-        .expect("error saving song");
-    assert_eq!(nrows, 1, "{}", new_song.key)
+fn insert_song(conn: &SqliteConnection, key: i64, hash: Option<String>, deleted: bool, bsmeta: Option<Vec<u8>>) {
+    let tstamp = Utc::now().timestamp_millis();
+    let res = task::block_on(
+        query!("INSERT INTO tSong (key, hash, tstamp, deleted, bsmeta) VALUES (?, ?, ?, ?, ?)", key, hash, tstamp, deleted, bsmeta)
+            .execute(conn)
+    ).expect("error saving song");
+    assert_eq!(res.rows_affected(), 1, "insert {}", key)
 }
 
-fn get_db_song(conn: &SqliteConnection, song_key: i32) -> Option<Song> {
-    use schema::tSong::dsl::*;
-    tSong
-        .find(song_key)
-        .first(conn).optional()
-        .expect("failed to load song")
+fn get_db_song(conn: &SqliteConnection, song_key: i64) -> Option<Song> {
+    task::block_on(
+        query_as!(Song, "SELECT * FROM tSong WHERE key = ?", song_key)
+            .fetch_optional(conn)
+    ).expect("failed to load song")
 }
 
 pub fn establish_connection() -> SqliteConnection {
-    use diesel::connection::SimpleConnection;
     dotenv().ok();
 
     let database_url = env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set");
-    let conn = SqliteConnection::establish(&database_url)
+    // We don't actually use this as a pool (yet) - it's just so we can pass it as a reference!
+    let conn = task::block_on(sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .min_connections(1)
+        .after_connect(|conn| Box::pin(async move {
+            conn.execute("
+                PRAGMA journal_mode = WAL;   -- better write-concurrency
+                PRAGMA synchronous = NORMAL; -- fsync only in critical moments
+                PRAGMA busy_timeout = 250;   -- sleep if the database is busy
+                PRAGMA foreign_keys = ON;    -- enforce foreign keys
+            ").await?;
+            Ok(())
+        }))
+        .connect(&database_url))
         .expect(&format!("Error connecting to {}", database_url));
 
-    conn.batch_execute("
-        PRAGMA journal_mode = WAL;          -- better write-concurrency
-        PRAGMA synchronous = NORMAL;        -- fsync only in critical moments
-        PRAGMA wal_autocheckpoint = 1000;   -- write WAL changes back every 1000 pages, for an in average 1MB WAL file. May affect readers if number is increased
-        PRAGMA wal_checkpoint(TRUNCATE);    -- free some space by truncating possibly massive WAL files from the last run.
-        PRAGMA busy_timeout = 250;          -- sleep if the database is busy
-        PRAGMA foreign_keys = ON;           -- enforce foreign keys
-    ").expect("couldn't set up connection");
+    task::block_on(conn.execute("
+        PRAGMA wal_checkpoint(TRUNCATE); -- free some space by truncating possibly massive WAL files from the last run.
+    ")).expect("couldn't set up connection");
 
     conn
 }

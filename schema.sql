@@ -10,7 +10,7 @@ CREATE TABLE tSong (
     deleted    BOOLEAN NOT NULL DEFAULT 0    CHECK (typeof(deleted) = 'integer'),
     -- Beatsaver JSON
     bsmeta     BLOB                          CHECK (typeof(bsmeta) = 'blob' OR bsmeta IS NULL),
-    -- TODO: once I have old metas, augment this check constraint to have a bsmeta when deleted = 0
+    -- TODO: once I have old metas, augment this check constraint to have a hash+bsmeta when deleted = 0
     CHECK (deleted = 0 OR deleted = 1)
 );
 -- TODO: figure why this can't be unique

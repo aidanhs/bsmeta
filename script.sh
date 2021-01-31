@@ -24,6 +24,11 @@ elif [ "$1" = run ]; then
     RUST_BACKTRACE=1 WASI_ROOT=$(pwd)/wasmtime/crates/wasi-common/WASI cargo run --release -- "$@"
     #RUST_BACKTRACE=1 WASI_ROOT=$(pwd)/wasmtime/crates/wasi-common/WASI cargo flamegraph -- "$@"
 
+elif [ "$1" = mkdb ]; then
+    . .env
+    rm "$DATABASE_URL"
+    sqlite3 "$DATABASE_URL" <schema.sql
+
 elif [ "$1" = plugins ]; then
     shift
 
