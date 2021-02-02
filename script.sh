@@ -16,6 +16,9 @@ if [ "$1" = sync ]; then
 elif [ "$1" = build ]; then
     WASI_ROOT=$(pwd)/wasmtime/crates/wasi-common/WASI cargo build --release
 
+elif [ "$1" = check ]; then
+    WASI_ROOT=$(pwd)/wasmtime/crates/wasi-common/WASI cargo check --release
+
 elif [ "$1" = doc ]; then
     WASI_ROOT=$(pwd)/wasmtime/crates/wasi-common/WASI cargo doc --release --open
 

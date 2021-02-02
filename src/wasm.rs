@@ -1019,7 +1019,7 @@ fn load_module(path: impl AsRef<Path>) -> Result<wasmer::Module> {
     Ok(module)
 }
 
-fn run_plugin(module: Module, mut plugin: tar::Archive<impl Read>, map_dat: Vec<u8>) -> Result<HashMap<String, AnalysisValue>> {
+fn run_plugin(module: Module, mut plugin: tar::Archive<impl Read>, dats: HashMap<String, Vec<u8>>) -> Result<HashMap<String, AnalysisValue>> {
     let store = module.store();
 
     let mut rofs = ROFilesystem::new();
@@ -1034,7 +1034,9 @@ fn run_plugin(module: Module, mut plugin: tar::Archive<impl Read>, map_dat: Vec<
         rofs.mkfile(work_ino, path, data);
     }
 
-    rofs.mkfile(data_ino, b"map.dat".to_vec(), map_dat);
+    for (name, data) in dats {
+        rofs.mkfile(data_ino, name.into_bytes(), data);
+    }
 
     rofs.calculate_preopens();
     debug!("created a virtualfs with preopens: {:?}", rofs.preopens);
@@ -1079,15 +1081,18 @@ fn run_plugin(module: Module, mut plugin: tar::Archive<impl Read>, map_dat: Vec<
     let f = instance.exports.get_function("_start")?;
     let ret = f.call(&[]);
     let fs = wasi_ctx.fs();
-    debug!("stdout:{{{}}}", String::from_utf8_lossy(&fs.stdout));
-    debug!("stderr:{{{}}}", String::from_utf8_lossy(&fs.stderr));
     match ret {
         Ok(vals) => {
+            debug!("stdout:{{#\n{}\n#}}", String::from_utf8_lossy(&fs.stdout));
+            debug!("stderr:{{#\n{}\n#}}", String::from_utf8_lossy(&fs.stderr));
             debug!("success: {:?}", vals);
-            Ok(serde_json::from_slice(&fs.stdout).context("couldn't parse script output")?)
+            Ok(serde_json::from_slice(&fs.stdout)
+               .with_context(|| format!("couldn't parse script output: {:?}", String::from_utf8_lossy(&fs.stdout)))?)
         },
         Err(re) => {
             warn!("_start runtime fail: {}", re);
+            warn!("stdout:{{#\n{}\n#}}", String::from_utf8_lossy(&fs.stdout));
+            warn!("stderr:{{#\n{}\n#}}", String::from_utf8_lossy(&fs.stderr));
             debug!("trace: {:#?}", re.trace());
             Err(re).context("failed to run analysis")
         }
@@ -1104,14 +1109,16 @@ pub struct AnalysisPlugin {
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AnalysisValue {
-    String(String),
+    Bool(bool),
     Number(serde_json::Number),
+    String(String),
 }
 
 impl AnalysisPlugin {
-    pub fn run(&self, map_dat: Vec<u8>) -> Result<HashMap<String, AnalysisValue>> {
+    /// A plugin will return a map from an arbitrary analysis key -> value
+    pub fn run(&self, dats: HashMap<String, Vec<u8>>) -> Result<HashMap<String, AnalysisValue>> {
         let ar = tar::Archive::new(&*self.tar_data);
-        run_plugin(self.module.clone(), ar, map_dat)
+        run_plugin(self.module.clone(), ar, dats)
     }
     pub fn name(&self) -> &str {
         &self.name
@@ -1133,14 +1140,35 @@ pub fn load_plugin(plugin_name: &str, interp: &str) -> Result<AnalysisPlugin> {
 pub fn test() -> Result<()> {
     let plugin = load_plugin("parity", "js")?;
 
-    for map_dat_path in &[
-        "../beatmaps/7f0356d54ded74ed2dbf56e7290a29fde002c0af/ExpertPlusStandard.dat",
-        "../beatmaps/9a1d001995cc0a2014352aa7148cbcbf2e489d89/Hard.dat",
-        "../beatmaps/28c746c1bbdaa7f10e894b5054c2e80a647ef1f6/ExpertPlusStandard.dat",
-    ] {
-        info!("considering {}", map_dat_path);
-        let ret = plugin.run(fs::read(map_dat_path)?)?;
-        info!("output: {:?} {}", ret, serde_json::to_string(&ret).unwrap())
+    let paths = &[
+        ("../beatmaps/7f0356d54ded74ed2dbf56e7290a29fde002c0af/", &[
+            "EasyStandard.dat",
+            "ExpertPlusStandard.dat",
+            "ExpertStandard.dat",
+            "HardStandard.dat",
+            "Info.dat",
+            "NormalStandard.dat",
+        ][..]),
+        ("../beatmaps/9a1d001995cc0a2014352aa7148cbcbf2e489d89/", &[
+            "Hard.dat",
+            "info.dat",
+        ][..]),
+        ("../beatmaps/28c746c1bbdaa7f10e894b5054c2e80a647ef1f6/", &[
+            "ExpertPlusStandard.dat",
+            "Info.dat",
+        ][..]),
+    ];
+
+    for (path, names) in paths {
+        let mut dats = HashMap::new();
+        for &name in names.iter() {
+            let datpath = format!("{}{}", path, name);
+            let name = if name.eq_ignore_ascii_case("info.dat") { "info.dat" } else { name };
+            dats.insert(name.to_owned(), fs::read(datpath)?);
+        }
+        info!("considering {} {:?}", path, names);
+        let ret = plugin.run(dats)?;
+        info!("output: {:?}, as json: {}", ret, serde_json::to_string(&ret).unwrap())
     }
     Ok(())
 }

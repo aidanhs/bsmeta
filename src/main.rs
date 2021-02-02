@@ -8,7 +8,7 @@ use decorum::R32;
 use dotenv::dotenv;
 use log::{info, warn};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::env;
 use std::fs;
@@ -210,49 +210,38 @@ fn analyse_songs() {
                 query!("SELECT data FROM tSongData WHERE key = ?", key).fetch_one(conn)
             ).expect("failed to load zipdata").data;
 
-            let mut map_dats: Option<HashSet<String>> = None;
             let mut ar = tar::Archive::new(&*data);
-            let mut datas = HashMap::new();
+            let mut dats = HashMap::new();
             for entry in ar.entries().expect("failed to parse dat tar") {
                 let mut entry = entry.expect("failed to decode dat entry");
                 let path_bytes = entry.path_bytes();
-                let path = str::from_utf8(&path_bytes).unwrap();
-                let lower_path = path.to_lowercase();
-                if lower_path == "info.dat" {
-                    let info: InfoDat = serde_json::from_reader(entry).unwrap();
-                    map_dats = Some(info.difficulty_beatmap_sets.into_iter()
-                        .flat_map(|ds| ds.difficulty_beatmaps)
-                        .map(|db| db.beatmap_filename)
-                        .collect())
+                // Standardise for info.dat to always be lowercase
+                let path = if path_bytes.eq_ignore_ascii_case(b"info.dat") {
+                    "info.dat"
                 } else {
-                    let mut v = vec![];
-                    let path = path.to_owned();
-                    entry.read_to_end(&mut v).unwrap();
-                    assert!(datas.insert(path, v).is_none())
-                }
+                    str::from_utf8(&path_bytes).unwrap()
+                }.to_owned();
+                let mut v = vec![];
+                let path = path.to_owned();
+                entry.read_to_end(&mut v).unwrap();
+                assert!(dats.insert(path, v).is_none())
             }
+            assert!(!dats.is_empty());
 
-            let map_dats = map_dats.unwrap();
-            info!("Identified {} maps to analyse", map_dats.len());
-            for (name, data) in datas {
-                if !map_dats.contains(&name) {
+            info!("Analysing {} dats", dats.len());
+            let results = match plugin.run(dats) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Failed to run analysis: {}", e);
                     continue
-                }
-                let results = match plugin.run(data) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!("Failed to run analysis: {}", e);
-                        continue
-                    },
-                };
-                // Prefix results with plugin
-                let results: HashMap<_, _> = results
-                    .into_iter()
-                    .map(|(k, v)| (format!("{}-{}", name, k), v))
-                    .collect();
-                let _ = results;
-            }
-            info!("Analysis complete");
+                },
+            };
+            // Prefix results with plugin
+            let results: HashMap<_, _> = results
+                .into_iter()
+                .map(|(k, v)| (format!("{}-{}", plugin.name(), k), v))
+                .collect();
+            info!("Analysis complete {:?}", results);
         }
     }
 

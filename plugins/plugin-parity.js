@@ -1,3 +1,17 @@
+// Note that parity is tricky and may sometimes flag maps wrongly - ideally we'll be able to catch these via
+// curators or by people messaging in #curation-request on discord.
+//
+// The rules in this script are as follows (credit to Pyrowarfare).
+//
+// Difficulties are considered like so:
+//  - easy, normal maps are ignored entirely - beginner players reset every swing so never follow parity
+//  - hard, expert, expert+ maps are all requires to 'pass' parity
+//
+//  A map passing parity means:
+//  - full errors are insta-fail - only very skilled mappers will deliberately break parity
+//  - warnings have a max of 10 - we may tweak this over time, depending on what gets flagged
+//
+
 import * as std from 'std';
 import * as os from 'os';
 globalThis.std = std;
@@ -5,7 +19,7 @@ globalThis.os = os;
 
 function noop() {}
 
-// Override console.log - stdout is how we're going to grab output
+// Override console.log to use stderr - stdout is how we're going to give output to bsmeta
 var oldLog = console.log;
 console.log = function () {
     var strings = [];
@@ -43,24 +57,53 @@ globalThis.window = {
 };
 
 std.loadScript("/work/bs-parity-main.js");
-// Post-load overrides
-var TOTAL_OUTPUT = [];
-outputUI = function (note, parity, message, messageType, persistent = false) {
-    TOTAL_OUTPUT.push([note, parity, message, messageType]);
-};
-clearOutput = noop;
 
-// Prep globals
-let parsed = JSON.parse(std.loadFile("/data/map.dat"));
-notesArray = getNotes(parsed);
-wallsArray = getWalls(parsed);
-ready = true;
+function analyseMap(mappath) {
+    // Post-load overrides
+    var TOTAL_OUTPUT = [];
+    outputUI = function (note, parity, message, messageType, persistent = false) {
+        TOTAL_OUTPUT.push([note, parity, message, messageType]);
+    };
+    clearOutput = noop;
 
-// Do the calc
-checkParity();
+    // Prep globals
+    let parsed = JSON.parse(std.loadFile(mappath));
+    notesArray = getNotes(parsed);
+    wallsArray = getWalls(parsed);
+    ready = true;
 
-// Return
+    // Do the calc
+    checkParity();
+
+    // Return
+    return {
+        num_errors: TOTAL_OUTPUT.filter((e) => e[3] === 'error').length,
+        num_warnings: TOTAL_OUTPUT.filter((e) => e[3] === 'warning').length,
+    };
+}
+
+let infodat = JSON.parse(std.loadFile("/data/info.dat"));
+let failed = [];
+infodat._difficultyBeatmapSets.forEach((diffSet) => {
+    let setName = diffSet._beatmapCharacteristicName;
+    diffSet._difficultyBeatmaps.forEach((diff) => {
+        let d = diff._difficulty;
+        if (d === "Easy" || d === "Normal") {
+            return;
+        }
+        if (d !== "Hard" && d !== "Expert" && d !== "ExpertPlus") {
+            throw 'Unknown difficulty';
+        }
+        let res = analyseMap('/data/' + diff._beatmapFilename);
+        if (res.num_errors > 0) {
+            failed.push(setName + ':' + d + ' had ' + res.num_errors + ' errors');
+        }
+        if (res.num_warnings > 10) {
+            failed.push(setName + ':' + d + ' had ' + res.num_warnings + ' warnings');
+        }
+    });
+});
 std.out.puts(JSON.stringify({
-    num_errors: TOTAL_OUTPUT.filter((e) => e[3] === 'error').length,
-    num_warnings: TOTAL_OUTPUT.filter((e) => e[3] === 'warning').length,
+    failed: failed.length !== 0,
+    whyfailed: failed.join(', '),
 }));
