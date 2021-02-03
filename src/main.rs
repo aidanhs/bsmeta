@@ -457,7 +457,7 @@ fn dl_latest_meta(conn: &SqliteConnection, client: &reqwest::blocking::Client) {
     println!("Identifying new songs");
     let mut page = 0;
     // Don't go too far if we've missed lots, we have the ability to backfill songs
-    const MAX_PAGE: usize = 10;
+    const MAX_PAGE: usize = 20;
     let mut maps: Vec<(BeatSaverMap, Vec<u8>)> = vec![];
     loop {
         let res = get_latest_maps(client, page).expect("failed to get latest maps");
