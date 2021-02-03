@@ -7,7 +7,7 @@ use chrono::Utc;
 use decorum::R32;
 use dotenv::dotenv;
 use log::{info, warn};
-use serde::Deserialize;
+use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::env;
@@ -106,7 +106,34 @@ struct DifficultyBeatmap {
 struct BeatSaverMap {
     key: String,
     hash: String,
+    description: String,
+    metadata: BeatSaverMapMetadata,
+    stats: BeatSaverMapStats,
     uploaded: String,
+    uploader: BeatSaverMapUploader,
+}
+#[derive(Deserialize)]
+struct BeatSaverMapMetadata {
+    #[serde(rename = "songName")]
+    song_name: String,
+    #[serde(rename = "songSubName")]
+    song_sub_name: String,
+    characteristics: Vec<BeatSaverMapMetadataCharacteristic>,
+}
+#[derive(Deserialize)]
+struct BeatSaverMapMetadataCharacteristic {
+    name: String,
+}
+#[derive(Deserialize)]
+struct BeatSaverMapStats {
+    #[serde(rename = "upVotes")]
+    upvotes: u32,
+    #[serde(rename = "downVotes")]
+    downvotes: u32,
+}
+#[derive(Deserialize)]
+struct BeatSaverMapUploader {
+    username: String,
 }
 
 const INFO_PAUSE: time::Duration = time::Duration::from_secs(3);
@@ -117,6 +144,7 @@ const BEATSAVER_DL_PAUSE: time::Duration = time::Duration::from_secs(120);
 const RATELIMIT_PADDING: time::Duration = time::Duration::from_secs(60);
 
 fn main() {
+    dotenv().ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("bsmeta=info,warn")).init();
     env::set_var("ASYNC_STD_THREAD_COUNT", "3");
 
@@ -136,6 +164,7 @@ fn main() {
         "dl" => dl_data(),
         "dlmeta" => dl_meta(),
         "analyse" => analyse_songs(),
+        "update-search" => update_search(),
         "test" => test().unwrap(),
         a => panic!("unknown arg {}", a),
     }
@@ -242,6 +271,9 @@ fn analyse_songs() {
                 .map(|(k, v)| (format!("{}-{}", plugin.name(), k), v))
                 .collect();
             info!("Analysis complete {:?}", results);
+
+            let result_json = serde_json::to_vec(&results).expect("failed to convert results to json");
+            insert_song_analysis(conn, key, plugin.name(), result_json)
         }
     }
 
@@ -266,6 +298,144 @@ fn analyse_songs() {
     //    }
     //    println!("{:?}", names_lens);
     //}
+}
+
+fn update_search() {
+    use meilisearch_sdk::document::Document;
+    use meilisearch_sdk::client::Client;
+
+    const ID_KEY: &str = "key";
+    const SEARCH_KEYS: &[&str] = &["name", "sub_name", "description"];
+    const _FILTER_KEYS: &[&str] = &["total_votes", "pct_upvoted", "uploaded_at_tstamp"];
+    const FACET_KEYS: &[&str] = &["uploader"];
+    const FACET_GROUP_KEYS: &[&str] = &["modes"];
+    const _VIEW_KEYS: &[&str] = &[];
+
+    #[derive(Serialize, Deserialize)]
+    #[derive(Debug)]
+    struct MeiliSong {
+        // ID
+        key: String,
+
+        // Search keys
+        name: String,
+        sub_name: String,
+        // TODO: use description from bsaber.com instead
+        description: String,
+
+        // Filter keys
+        total_votes: u32,
+        pct_upvoted: u8,
+        uploaded_at_tstamp: i64,
+        // TODO: difficulties
+        // TODO: categories from bsaber.com?
+
+        // Facet keys
+        uploader: String,
+
+        // Facet group keys
+        modes: Vec<String>,
+        // TODO: categories from bsaber.com
+
+        // Just for viewing
+        // TODO: bsaber.com post id
+    }
+
+    impl Document for MeiliSong {
+        type UIDType = String;
+        fn get_uid(&self) -> &Self::UIDType { &self.key }
+    }
+
+    async fn wait_progress_complete(progress: meilisearch_sdk::progress::Progress<'_>) {
+        loop {
+            match progress.get_status().await.expect("meilisearch returned error") {
+                meilisearch_sdk::progress::UpdateStatus::Processed { content } => {
+                    assert!(content.error.is_none());
+                    break
+                },
+                meilisearch_sdk::progress::UpdateStatus::Failed { content } => {
+                    panic!("{:?}", content)
+                }
+                meilisearch_sdk::progress::UpdateStatus::Enqueued { content: _ } => {
+                    tokio::time::delay_for(time::Duration::from_secs(1)).await
+                },
+            }
+        }
+    }
+
+    let conn = &establish_connection();
+
+    let meili_url = env::var("MEILI_URL").expect("no meili url");
+    let meili_masterkey = env::var("MEILI_PRIVATEKEY").expect("no meili masterkey");
+    let client = Client::new(&meili_url, &meili_masterkey);
+
+    const BATCH_SIZE: usize = 1000;
+
+    let mut rt = tokio::runtime::Builder::new().basic_scheduler().enable_all().build().expect("failed to get tokio runtime");
+
+    rt.block_on(async {
+        client.delete_index("songs").await.expect("failed to delete index");
+        let idx = client.create_index("songs", Some(ID_KEY)).await.expect("failed to create index");
+
+        let searchable_attributes = SEARCH_KEYS.into_iter().chain(FACET_KEYS).chain(FACET_GROUP_KEYS)
+            .map(|&s| s.to_owned())
+            .collect();
+        let attributes_for_faceting = FACET_KEYS.into_iter().chain(FACET_GROUP_KEYS)
+            .map(|&s| s.to_owned())
+            .collect();
+        let progress = idx.set_settings(&meilisearch_sdk::settings::Settings {
+            synonyms: None,
+            stop_words: None,
+            ranking_rules: None,
+            attributes_for_faceting: Some(attributes_for_faceting),
+            distinct_attribute: None,
+            searchable_attributes: Some(searchable_attributes),
+            displayed_attributes: Some(vec!["*".to_owned()]),
+        }).await.expect("failed to set settings");
+        wait_progress_complete(progress).await;
+
+        println!("Waiting for meilisearch to apply index settings");
+
+        let keys = task::block_on(query!("SELECT key FROM tSong WHERE deleted = false").fetch_all(conn)).expect("failed to select keys");
+        let mut keys: Vec<_> = keys.into_iter().map(|res| res.key).collect();
+        println!("Loaded keys");
+        keys.sort();
+
+        let num_songs = keys.len();
+        let mut batch = vec![];
+        for (i, key) in keys.into_iter().enumerate() {
+            let key_str = num_to_key(key);
+            info!("Considering song {}/{}: {}", i+1, num_songs, key_str);
+            if batch.len() == BATCH_SIZE {
+                let progress = idx.add_or_replace(&batch, Some(ID_KEY)).await.expect("failed to send batch of songs for addition");
+                wait_progress_complete(progress).await;
+                batch.clear()
+            }
+            let song = get_db_song(conn, key).expect("song went missing from db");
+            let bsmeta: BeatSaverMap = serde_json::from_slice(&song.bsmeta.expect("no bsmeta for song")).expect("failed to deserialize bsmeta");
+
+            let total_votes = bsmeta.stats.upvotes + bsmeta.stats.downvotes;
+            let pct_upvoted = if total_votes == 0 { 100. } else { (100. * f64::from(bsmeta.stats.upvotes) / f64::from(total_votes)).round() };
+            assert!(0. <= pct_upvoted && pct_upvoted <= 100.);
+            let pct_upvoted = pct_upvoted as u8;
+            let uploaded_at_tstamp = chrono::DateTime::parse_from_rfc3339(&bsmeta.uploaded).expect("failed to parse bsmeta uploaded").timestamp();
+            let ms = MeiliSong {
+                key: key_str,
+                name: bsmeta.metadata.song_name,
+                sub_name: bsmeta.metadata.song_sub_name,
+                description: bsmeta.description,
+                total_votes,
+                pct_upvoted,
+                uploaded_at_tstamp,
+                uploader: bsmeta.uploader.username,
+                modes: bsmeta.metadata.characteristics.into_iter().map(|c| c.name).collect()
+            };
+            batch.push(ms)
+        }
+        let progress = idx.add_or_replace(&batch, Some(ID_KEY)).await.expect("failed to send batch of songs for addition");
+        wait_progress_complete(progress).await;
+        batch.clear()
+    });
 }
 
 fn make_client() -> reqwest::blocking::Client {
@@ -317,7 +487,7 @@ fn dl_latest_meta(conn: &SqliteConnection, client: &reqwest::blocking::Client) {
 
     println!("Upserting {} map metas", maps.len());
     // Deliberately go oldest first, so if there's an error we can resume
-    while let Some((BeatSaverMap { key, hash, uploaded: _ }, raw_meta)) = maps.pop() {
+    while let Some((BeatSaverMap { key, hash, .. }, raw_meta)) = maps.pop() {
         println!("Upserting {}", key);
         upsert_song(conn, key_to_num(&key), Some(hash), false, Some(raw_meta))
     }
@@ -724,7 +894,7 @@ fn ogg_duration(ogg: &[u8]) -> Result<R32> {
     Ok(len_play)
 }
 
-// https://github.com/launchbadge/sqlx/issues/328 - for inserting a Song
+// https://github.com/launchbadge/sqlx/issues/328 - for inserting a Song struct
 fn set_song_data(conn: &SqliteConnection, key: i64, data: Vec<u8>, extra_meta: ExtraMeta, zipdata: Vec<u8>) {
     let res = task::block_on(
         query!("INSERT INTO tSongData (key, data, extra_meta, zipdata) VALUES (?, ?, ?, ?)", key, data, extra_meta, zipdata)
@@ -745,6 +915,14 @@ fn upsert_song(conn: &SqliteConnection, key: i64, hash: Option<String>, deleted:
     assert_eq!(res.rows_affected(), 1, "upsert {}", key)
 }
 
+fn insert_song_analysis(conn: &SqliteConnection, key: i64, analysis_name: &str, result: Vec<u8>) {
+    let res = task::block_on(
+        query!("INSERT INTO tSongAnalysis (key, analysis_name, result) VALUES (?, ?, ?)", key, analysis_name, result)
+            .execute(conn)
+    ).expect("error saving song analysis");
+    assert_eq!(res.rows_affected(), 1, "insert {}", key)
+}
+
 fn insert_song(conn: &SqliteConnection, key: i64, hash: Option<String>, deleted: bool, bsmeta: Option<Vec<u8>>) {
     let tstamp = Utc::now().timestamp_millis();
     let res = task::block_on(
@@ -762,8 +940,6 @@ fn get_db_song(conn: &SqliteConnection, song_key: i64) -> Option<Song> {
 }
 
 pub fn establish_connection() -> SqliteConnection {
-    dotenv().ok();
-
     let database_url = env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set");
     // We don't actually use this as a pool (yet) - it's just so we can pass it as a reference!

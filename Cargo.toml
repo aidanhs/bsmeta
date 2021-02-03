@@ -15,12 +15,15 @@ dotenv = "0.15.0"
 env_logger = "0.8"
 lewton = "0.10"
 log = "0.4"
+#meilisearch-sdk = "0.4.0"
+# https://github.com/meilisearch/meilisearch-rust/pull/76
+meilisearch-sdk = { git = "ssh://git@github.com/meilisearch/meilisearch-rust.git", rev = "d610bc6" }
 reqwest = { version = "0.10", default-features = false, features = ["blocking", "brotli", "gzip", "rustls-tls"] }
-#rusqlite = "0.24"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 sqlx = { version = "0.4.2", features = [ "runtime-async-std-rustls", "sqlite" ] }
 tar = "0.4"
+tokio = { version = "0.2", features = ["rt-core", "tcp", "time"] }
 typetag = "0.1"
 zip = "0.5"
 
@@ -34,3 +37,4 @@ wasmer-wasi = "1"
 [profile.release]
 debug = 1
 overflow-checks = true
+lto = "thin"
