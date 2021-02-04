@@ -234,7 +234,7 @@ fn analyse_songs() {
             if exists {
                 continue
             }
-            info!("Performing analysis {} on {}", plugin.name(), key_str);
+            info!("Performing analysis {:?} on {}", plugin.name(), key_str);
             let data = task::block_on(
                 query!("SELECT data FROM tSongData WHERE key = ?", key).fetch_one(conn)
             ).expect("failed to load zipdata").data;
@@ -265,12 +265,6 @@ fn analyse_songs() {
                     continue
                 },
             };
-            // Prefix results with plugin
-            let results: HashMap<_, _> = results
-                .into_iter()
-                .map(|(k, v)| (format!("{}-{}", plugin.name(), k), v))
-                .collect();
-            info!("Analysis complete {:?}", results);
 
             let result_json = serde_json::to_vec(&results).expect("failed to convert results to json");
             insert_song_analysis(conn, key, plugin.name(), result_json)
@@ -338,6 +332,8 @@ fn update_search() {
         // TODO: categories from bsaber.com
 
         // Just for viewing
+        #[serde(flatten)]
+        analyses: HashMap<String, serde_json::Value>,
         // TODO: bsaber.com post id
     }
 
@@ -374,7 +370,12 @@ fn update_search() {
     let mut rt = tokio::runtime::Builder::new().basic_scheduler().enable_all().build().expect("failed to get tokio runtime");
 
     rt.block_on(async {
-        client.delete_index("songs").await.expect("failed to delete index");
+        match client.delete_index("songs").await {
+            Ok(()) => (),
+            Err(meilisearch_sdk::errors::Error::MeiliSearchError { error_code: meilisearch_sdk::errors::ErrorCode::IndexNotFound, .. }) => (),
+            Err(e) => panic!("failed to delete index: {}", e),
+        }
+
         let idx = client.create_index("songs", Some(ID_KEY)).await.expect("failed to create index");
 
         let searchable_attributes = SEARCH_KEYS.into_iter().chain(FACET_KEYS).chain(FACET_GROUP_KEYS)
@@ -414,6 +415,16 @@ fn update_search() {
             let song = get_db_song(conn, key).expect("song went missing from db");
             let bsmeta: BeatSaverMap = serde_json::from_slice(&song.bsmeta.expect("no bsmeta for song")).expect("failed to deserialize bsmeta");
 
+            let mut analyses = HashMap::new();
+            let analysis_results: Vec<_> = task::block_on(
+                query!("SELECT analysis_name, result FROM tSongAnalysis WHERE key = ?", key).fetch_all(conn)
+            ).expect("failed to retrieve analyses");
+            for ar in analysis_results {
+                let analysis_results_map: HashMap<String, serde_json::Value> = serde_json::from_slice(&ar.result).expect("couldn't parse analysis result");
+                // Prefix results with plugin
+                analyses.extend(analysis_results_map.into_iter().map(|(k, v)| (format!("{}-{}", ar.analysis_name, k), v)));
+            }
+
             let total_votes = bsmeta.stats.upvotes + bsmeta.stats.downvotes;
             let pct_upvoted = if total_votes == 0 { 100. } else { (100. * f64::from(bsmeta.stats.upvotes) / f64::from(total_votes)).round() };
             assert!(0. <= pct_upvoted && pct_upvoted <= 100.);
@@ -428,7 +439,8 @@ fn update_search() {
                 pct_upvoted,
                 uploaded_at_tstamp,
                 uploader: bsmeta.uploader.username,
-                modes: bsmeta.metadata.characteristics.into_iter().map(|c| c.name).collect()
+                modes: bsmeta.metadata.characteristics.into_iter().map(|c| c.name).collect(),
+                analyses,
             };
             batch.push(ms)
         }

@@ -29,7 +29,7 @@ CREATE TABLE tSongData (
 
 CREATE TABLE tSongAnalysis (
     key           INTEGER NOT NULL CHECK (typeof(key) = 'integer'),
-    analysis_name TEXT    NOT NULL CHECK (typeof(analysis_name) = 'text'),
+    analysis_name TEXT NOT NULL    CHECK (typeof(analysis_name) = 'text'),
     result        BLOB NOT NULL    CHECK (typeof(result) = 'blob'),
     PRIMARY KEY (key, analysis_name),
     FOREIGN KEY (key) REFERENCES tSong(key)
