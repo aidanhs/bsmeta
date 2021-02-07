@@ -1125,11 +1125,9 @@ impl AnalysisPlugin {
     }
 }
 
-pub fn load_plugin(plugin_name: &str, interp: &str) -> Result<AnalysisPlugin> {
-    let interp_path = format!("plugins/dist/{}.wasm", interp);
-    let module = load_module(interp_path).with_context(|| format!("failed to load interp module {}", interp))?;
-    let plugin_path = format!("plugins/dist/{}.tar", plugin_name);
-    let tar_data = fs::read(&plugin_path).with_context(|| format!("failed to read {}", plugin_path))?;
+pub fn load_plugin(plugin_name: &str, interp_path: &Path, plugin_path: &Path) -> Result<AnalysisPlugin> {
+    let module = load_module(interp_path).with_context(|| format!("failed to load interp module {}", interp_path.display()))?;
+    let tar_data = fs::read(&plugin_path).with_context(|| format!("failed to read {}", plugin_path.display()))?;
     Ok(AnalysisPlugin {
         module,
         tar_data,
@@ -1138,7 +1136,7 @@ pub fn load_plugin(plugin_name: &str, interp: &str) -> Result<AnalysisPlugin> {
 }
 
 pub fn test() -> Result<()> {
-    let plugin = load_plugin("parity", "js")?;
+    let plugin = load_plugin("parity", "plugins/dist/js.wasm".as_ref(), "plugins/dist/parity.tar".as_ref())?;
 
     let paths = &[
         ("../beatmaps/7f0356d54ded74ed2dbf56e7290a29fde002c0af/", &[

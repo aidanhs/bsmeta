@@ -5,12 +5,13 @@
 //
 // Difficulties are considered like so:
 //  - easy, normal maps are ignored entirely - beginner players reset every swing so never follow parity
-//  - hard, expert, expert+ maps are all requires to 'pass' parity
+//  - hard, expert, expert+ maps are all required to 'pass' parity
 //
 //  A map passing parity means:
 //  - full errors are insta-fail - only very skilled mappers will deliberately break parity
 //  - warnings have a max of 10 - we may tweak this over time, depending on what gets flagged
 //
+//  Note: this code is (like the rest of the repo) licensed under AGPL, but bs-parity itself is GPLv3
 
 import * as std from 'std';
 import * as os from 'os';

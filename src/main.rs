@@ -216,16 +216,22 @@ fn analyse_songs() {
     ).expect("failed to select key");
     let to_analyse: Vec<_> = to_analyse.into_iter().map(|res| res.key).collect();
 
-    // TODO: load from plugins list
-    let analyses = &[
-        wasm::load_plugin("parity", "js").expect("failed to load parity plugin"),
-    ];
+    let pluginlist_file = fs::File::open("plugins/dist/pluginlist.json").expect("failed to open plugin list");
+    let pluginlist: HashMap<String, String> = serde_json::from_reader(pluginlist_file).expect("failed to parse plugin list");
+    let mut analyses = vec![];
+    for (name, interp) in pluginlist.into_iter() {
+        println!("Loading plugin {}", name);
+        let interp_path = format!("plugins/dist/{}.wasm", interp);
+        let plugin_path = format!("plugins/dist/{}.tar", name);
+        let plugin = wasm::load_plugin("parity", interp_path.as_ref(), plugin_path.as_ref()).expect("failed to load plugin");
+        analyses.push(plugin)
+    }
 
     let num_to_analyse = to_analyse.len();
     for (i, key) in to_analyse.into_iter().enumerate() {
         let key_str = num_to_key(key);
         info!("Considering song {}/{}: {}", i+1, num_to_analyse, key_str);
-        for plugin in analyses {
+        for plugin in analyses.iter() {
             let plugin_name = plugin.name();
             let exists: bool = task::block_on(
                 query!("SELECT count(*) as count FROM tSongAnalysis WHERE key = ? AND analysis_name = ?", key, plugin_name)
