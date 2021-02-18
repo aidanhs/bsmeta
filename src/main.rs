@@ -359,7 +359,7 @@ fn update_search() {
                     panic!("{:?}", content)
                 }
                 meilisearch_sdk::progress::UpdateStatus::Enqueued { content: _ } => {
-                    tokio::time::delay_for(time::Duration::from_secs(1)).await
+                    task::sleep(time::Duration::from_secs(1)).await
                 },
             }
         }
@@ -373,9 +373,7 @@ fn update_search() {
 
     const BATCH_SIZE: usize = 1000;
 
-    let mut rt = tokio::runtime::Builder::new().basic_scheduler().enable_all().build().expect("failed to get tokio runtime");
-
-    rt.block_on(async {
+    task::block_on(async {
         match client.delete_index("songs").await {
             Ok(()) => (),
             Err(meilisearch_sdk::errors::Error::MeiliSearchError { error_code: meilisearch_sdk::errors::ErrorCode::IndexNotFound, .. }) => (),
@@ -403,7 +401,7 @@ fn update_search() {
 
         println!("Waiting for meilisearch to apply index settings");
 
-        let keys = task::block_on(query!("SELECT key FROM tSong WHERE deleted = false").fetch_all(conn)).expect("failed to select keys");
+        let keys = query!("SELECT key FROM tSong WHERE deleted = false").fetch_all(conn).await.expect("failed to select keys");
         let mut keys: Vec<_> = keys.into_iter().map(|res| res.key).collect();
         println!("Loaded keys");
         keys.sort();
@@ -422,9 +420,8 @@ fn update_search() {
             let bsmeta: BeatSaverMap = serde_json::from_slice(&song.bsmeta.expect("no bsmeta for song")).expect("failed to deserialize bsmeta");
 
             let mut analyses = HashMap::new();
-            let analysis_results: Vec<_> = task::block_on(
-                query!("SELECT analysis_name, result FROM tSongAnalysis WHERE key = ?", key).fetch_all(conn)
-            ).expect("failed to retrieve analyses");
+            let analysis_results: Vec<_> =
+                query!("SELECT analysis_name, result FROM tSongAnalysis WHERE key = ?", key).fetch_all(conn).await.expect("failed to retrieve analyses");
             for ar in analysis_results {
                 let analysis_results_map: HashMap<String, serde_json::Value> = serde_json::from_slice(&ar.result).expect("couldn't parse analysis result");
                 // Prefix results with plugin
