@@ -444,13 +444,32 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
 
     fn fd_filestat_get(
         &self,
-        _fd: types::Fd
+        fd: types::Fd
     ) -> WasiResult<types::Filestat> {
-        todo!()
-        //let required_rights = HandleRights::from_base(types::Rights::FD_FILESTAT_GET);
-        //let entry = self.get_entry(fd)?;
-        //let host_filestat = entry.as_handle(&required_rights)?.filestat_get()?;
-        //Ok(host_filestat)
+        // In theory fdstat has more special handling for the 'capability' directories
+        let types::Fdstat { fs_filetype, fs_flags: _, fs_rights_base: _, fs_rights_inheriting: _ } = self.fd_fdstat_get(fd)?;
+        let (dev, ino, size) = match fs_filetype {
+            types::Filetype::RegularFile |
+            types::Filetype::Directory => {
+                let fs = self.fs();
+                let (ino, _) = fs.fds.get(&fd).ok_or(mywasi::Error::Badf)?;
+                let size = if fs_filetype == types::Filetype::Directory { 0 } else {
+                    fs.data.get(&ino).expect("missing ino data").len()
+                };
+                (0, ino.0.into(), size.try_into().expect("size too big"))
+            },
+            _ => (1, 1, 0),
+        };
+        Ok(types::Filestat {
+            dev,
+            ino,
+            filetype: fs_filetype,
+            nlink: 1,
+            size,
+            atim: 0,
+            mtim: 0,
+            ctim: 0,
+        })
     }
 
     fn fd_filestat_set_size(
@@ -707,15 +726,9 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
 
     fn fd_tell(
         &self,
-        _fd: types::Fd
+        fd: types::Fd
     ) -> WasiResult<types::Filesize> {
-        todo!()
-        //let required_rights = HandleRights::from_base(types::Rights::FD_TELL);
-        //let entry = self.get_entry(fd)?;
-        //let host_offset = entry
-        //    .as_handle(&required_rights)?
-        //    .seek(SeekFrom::Current(0))?;
-        //Ok(host_offset)
+        self.fs().fds.get(&fd).map(|f| f.1).ok_or(mywasi::Error::Badf)
     }
 
     fn fd_write(
@@ -733,8 +746,8 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
 
         let mut fs = self.fs();
         let nwritten = match fd.into() {
-            __WASI_STDOUT_FILENO => fs.stdout.write_vectored(&slices),
-            __WASI_STDERR_FILENO => fs.stderr.write_vectored(&slices),
+            __WASI_STDOUT_FILENO => { /*io::stderr().lock().write_vectored(&slices).unwrap();*/ fs.stdout.write_vectored(&slices) },
+            __WASI_STDERR_FILENO => { /*io::stderr().lock().write_vectored(&slices).unwrap();*/ fs.stderr.write_vectored(&slices) },
             _ => return Err(mywasi::Error::Badf),
         }.map_err(|_| mywasi::Error::Io)?;
         let nwritten = nwritten.try_into()?;
@@ -764,18 +777,34 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
 
     fn path_filestat_get(
         &self,
-        _dirfd: types::Fd,
+        dirfd: types::Fd,
         _flags: types::Lookupflags,
-        _path: &GuestPtr<'_, str>,
+        path: &GuestPtr<'_, str>,
     ) -> WasiResult<types::Filestat> {
-        todo!()
-        //let required_rights = HandleRights::from_base(types::Rights::PATH_FILESTAT_GET);
-        //let entry = self.get_entry(dirfd)?;
-        //let path = path.as_str()?;
-        //let (dirfd, path) = path::get(&entry, &required_rights, flags, path.deref(), false)?;
-        //let host_filestat =
-        //    dirfd.filestat_get_at(&path, flags.contains(&types::Lookupflags::SYMLINK_FOLLOW))?;
-        //Ok(host_filestat)
+        let path_slice = path.as_bytes().as_slice()?;
+        trace!("wasicall in path_filestat_get: {:?}", (dirfd, String::from_utf8_lossy(&path_slice)));
+        let fs = self.fs();
+        let (dir_ino, _) = fs.fds.get(&dirfd).unwrap();
+        let path_ino = *fs.children.get(dir_ino).unwrap().get(&*path_slice).ok_or(mywasi::Error::Noent)?;
+        let (filetype, size) = if let Some(d) = fs.data.get(&path_ino) {
+            (types::Filetype::RegularFile, d.len().try_into().expect("size too big"))
+        } else if fs.children.contains_key(&path_ino) {
+            (types::Filetype::Directory, 0)
+        } else {
+            unreachable!()
+        };
+        let ino = path_ino.0.into();
+        let dev = 0;
+        Ok(types::Filestat {
+            dev,
+            ino,
+            filetype,
+            nlink: 1,
+            size,
+            atim: 0,
+            mtim: 0,
+            ctim: 0,
+        })
     }
 
     fn path_filestat_set_times(
@@ -865,6 +894,7 @@ impl<'a> WasiSnapshotPreview1 for WasiCtx {
             unimplemented!()
         }
         let path_slice = path.as_bytes().as_slice()?;
+        trace!("wasicall in path_open: {:?}", (dirfd, String::from_utf8_lossy(&path_slice)));
         let mut fs = self.fs();
         let (dir_ino, _) = fs.fds.get(&dirfd).unwrap();
         let path_ino = *fs.children.get(dir_ino).unwrap().get(&*path_slice).ok_or(mywasi::Error::Noent)?;
@@ -1043,34 +1073,60 @@ fn run_plugin(module: Module, mut plugin: tar::Archive<impl Read>, dats: HashMap
 
     let wasi_ctx = WasiCtx::new(rofs);
 
-    macro_rules! gen {
-        ($name:ident, $( $arg:ident ),*) => {
+    macro_rules! genraw {
+        ($module:ident, $name:ident, ($( $arg:ident ),*), $e:expr) => {
             (
-                ("wasi_snapshot_preview1", stringify!($name)),
+                (stringify!($module), stringify!($name)),
                 Function::new_native_with_env(&store, wasi_ctx.clone(), move |env: &WasiCtx, $( $arg ),*| {
                     trace!("wasicall >> {} {:?}", stringify!($name), ($( $arg ),*));
                     let bc = env.bc.lock().unwrap();
                     let memory = MemoryWrapper(env.memory_ref().expect("memory not set up"), &bc);
-                    mywasi::wasi_snapshot_preview1::$name(env, &memory, $( $arg ),*).expect("wasi call trapped")
+                    ($e)(env, memory)
                 }).to_export(),
             )
         };
     }
+    macro_rules! gen {
+        ($name:ident, ($( $arg:ident ),*)) => {
+            genraw!(wasi_snapshot_preview1, $name, ($( $arg ),*), move |env, memory| {
+                mywasi::wasi_snapshot_preview1::$name(env, &memory, $( $arg ),*).expect("wasi call trapped")
+            })
+        };
+    }
 
     let overrides = vec![
-        gen!(args_get, argv, argv_buf),
-        gen!(args_sizes_get, argc, argv_buf_size),
-        gen!(clock_time_get, clock_id, precision, time),
-        gen!(environ_sizes_get, environ_count, environ_buf_size),
+        genraw!(env, aidandup, (fd), move |env: &WasiCtx, _memory: MemoryWrapper| -> i32 {
+            // TODO: this isn't right, since it duplicates the file descriptor, rather than having
+            // it refer to the same underlying thing
+            // TODO: it also isn't the next lowest fd
+            let fd: u32 = fd;
+            let fd = mywasi::types::Fd::from(fd);
+            let mut fs = env.fs();
+            let &(ino, pos) = match fs.fds.get(&fd) {
+                Some(fd) => fd,
+                None => return mywasi::types::Errno::Badf.into(),
+            };
+            let new_fd = fs.new_fd(ino);
+            fs.fds.get_mut(&new_fd).expect("new fd doesn't exist").1 = pos;
+            new_fd.try_into().expect("fd too large")
+        }),
 
-        gen!(path_open, dirfd, dirflags, path_ptr, path_len, o_flags, fs_rights_base, fs_rights_inheriting, fs_flags, fd),
-        gen!(fd_prestat_get, fd, buf_ptr),
-        gen!(fd_prestat_dir_name, fd, path, path_len),
-        gen!(fd_fdstat_get, fd, stat_ptr),
-        gen!(fd_write, fd, iovs_ptr, iovs_len, nwritten_ptr),
-        gen!(fd_seek, fd, offset, whence, newoffset_ptr),
-        gen!(fd_read, fd, iovs_ptr, iovs_len, nread_ptr),
-        gen!(fd_close, fd),
+        gen!(args_get, (argv, argv_buf)),
+        gen!(args_sizes_get, (argc, argv_buf_size)),
+        gen!(clock_time_get, (clock_id, precision, time)),
+        gen!(environ_sizes_get, (environ_count, environ_buf_size)),
+
+        gen!(path_filestat_get, (dirfd, flags, path_ptr, path_len, buf_ptr)),
+        gen!(path_open, (dirfd, dirflags, path_ptr, path_len, o_flags, fs_rights_base, fs_rights_inheriting, fs_flags, fd)),
+        gen!(fd_prestat_get, (fd, buf_ptr)),
+        gen!(fd_prestat_dir_name, (fd, path, path_len)),
+        gen!(fd_fdstat_get, (fd, stat_ptr)),
+        gen!(fd_filestat_get, (fd, stat_ptr)),
+        gen!(fd_write, (fd, iovs_ptr, iovs_len, nwritten_ptr)),
+        gen!(fd_seek, (fd, offset, whence, newoffset_ptr)),
+        gen!(fd_read, (fd, iovs_ptr, iovs_len, nread_ptr)),
+        gen!(fd_tell, (fd, offset_ptr)),
+        gen!(fd_close, (fd)),
     ].into_iter().collect();
 
     let importobj = FakeResolver::new(&store, module.imports(), &overrides);
@@ -1136,7 +1192,8 @@ pub fn load_plugin(plugin_name: &str, interp_path: &Path, plugin_path: &Path) ->
 }
 
 pub fn test() -> Result<()> {
-    let plugin = load_plugin("parity", "plugins/dist/js.wasm".as_ref(), "plugins/dist/parity.tar".as_ref())?;
+    let plugin = load_plugin("parity", "plugins/dist/py.wasm".as_ref(), "plugins/dist/difficulty.tar".as_ref())?;
+    //let plugin = load_plugin("parity", "plugins/dist/js.wasm".as_ref(), "plugins/dist/parity.tar".as_ref())?;
 
     let paths = &[
         ("../beatmaps/7f0356d54ded74ed2dbf56e7290a29fde002c0af/", &[

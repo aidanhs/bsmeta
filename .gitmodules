@@ -4,3 +4,6 @@
 [submodule "plugins/bs-parity"]
 	path = plugins/bs-parity
 	url = git@github.com:GalaxyMaster2/bs-parity.git
+[submodule "plugins/cpython"]
+	path = plugins/cpython
+	url = git@github.com:python/cpython.git

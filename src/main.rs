@@ -807,7 +807,7 @@ fn zip_to_dats_tar(zipdata: &[u8]) -> Result<(Vec<u8>, ExtraMeta)> {
     let zipreader = io::Cursor::new(zipdata);
 
     let mut infodat: Option<(String, InfoDat)> = None;
-    let mut zip = zip::ZipArchive::new(zipreader).expect("failed to load zip");
+    let mut zip = zip::ZipArchive::new(zipreader).context("failed to load zip")?;
     for zip_index in 0..zip.len() {
         let entry = zip.by_index(zip_index).context("failed to get entry from zip")?;
         let name_bytes = entry.name_raw();

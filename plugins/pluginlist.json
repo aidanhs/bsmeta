@@ -5,5 +5,12 @@
             "plugin-parity.js": "script.js",
             "bs-parity/scripts/main.js": "bs-parity-main.js"
         }
+    },
+    "difficulty": {
+        "interp": "py",
+        "files": {
+            "plugin-difficulty.py": "script.py",
+            "dist/pylib.zip": "lib.zip"
+        }
     }
 }

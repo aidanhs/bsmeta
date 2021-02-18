@@ -1,0 +1,33 @@
+diff --git a/configure b/configure
+index 5640c2dc12..e049f1917e 100755
+--- a/configure
++++ b/configure
+@@ -7332,7 +7332,7 @@ esac
+ 
+ # ICC needs -fp-model strict or floats behave badly
+ case "$CC" in
+-*icc*)
++*dont-detect-wasicc*)
+     CFLAGS_NODIST="$CFLAGS_NODIST -fp-model strict"
+     ;;
+ esac
+@@ -12375,7 +12375,8 @@ fi
+ done
+ 
+ 
+-ac_fn_c_check_func "$LINENO" "dup2" "ac_cv_func_dup2"
++#ac_fn_c_check_func "$LINENO" "dup2" "ac_cv_func_dup2"
++ac_cv_func_dup2=yes
+ if test "x$ac_cv_func_dup2" = xyes; then :
+   $as_echo "#define HAVE_DUP2 1" >>confdefs.h
+ 
+@@ -12492,7 +12493,8 @@ done
+ 
+ for ac_func in clock_gettime
+ do :
+-  ac_fn_c_check_func "$LINENO" "clock_gettime" "ac_cv_func_clock_gettime"
++  #ac_fn_c_check_func "$LINENO" "clock_gettime" "ac_cv_func_clock_gettime"
++  ac_cv_func_clock_gettime=yes
+ if test "x$ac_cv_func_clock_gettime" = xyes; then :
+   cat >>confdefs.h <<_ACEOF
+ #define HAVE_CLOCK_GETTIME 1
