@@ -23,6 +23,7 @@ use sqlx::{query, query_as};
 type SqliteConnection = sqlx::sqlite::SqlitePool;
 
 mod scripts;
+mod server;
 mod wasm;
 mod models {
     use decorum::R32;
@@ -165,6 +166,7 @@ fn main() {
         "dlmeta" => dl_meta(),
         "analyse" => analyse_songs(),
         "update-search" => update_search(),
+        "serve" => server::serve(),
         "test" => test().unwrap(),
         a => panic!("unknown arg {}", a),
     }
@@ -241,31 +243,12 @@ fn analyse_songs() {
                 continue
             }
             info!("Performing analysis {:?} on {}", plugin.name(), key_str);
-            let data = task::block_on(
-                query!("SELECT data FROM tSongData WHERE key = ?", key).fetch_one(conn)
-            ).expect("failed to load zipdata").data;
-
-            let mut ar = tar::Archive::new(&*data);
-            let mut dats = HashMap::new();
-            for entry in ar.entries().expect("failed to parse dat tar") {
-                let mut entry = entry.expect("failed to decode dat entry");
-                let path_bytes = entry.path_bytes();
-                // Standardise for info.dat to always be lowercase
-                let path = if path_bytes.eq_ignore_ascii_case(b"info.dat") {
-                    "info.dat"
-                } else {
-                    str::from_utf8(&path_bytes).unwrap()
-                }.to_owned();
-                let mut v = vec![];
-                let path = path.to_owned();
-                entry.read_to_end(&mut v).unwrap();
-                assert!(dats.insert(path, v).is_none())
-            }
-            assert!(!dats.is_empty());
+            let dats = load_dats_for_analysis(conn, key);
 
             info!("Analysing {} dats", dats.len());
             let results = match plugin.run(dats) {
-                Ok(r) => r,
+                Ok((_stderr, Ok(r))) => r,
+                Ok((_, Err(e))) |
                 Err(e) => {
                     warn!("Failed to run analysis: {}", e);
                     continue
@@ -298,6 +281,32 @@ fn analyse_songs() {
     //    }
     //    println!("{:?}", names_lens);
     //}
+}
+
+fn load_dats_for_analysis(conn: &SqliteConnection, key: i64) -> HashMap<String, Vec<u8>> {
+    let data = task::block_on(
+        query!("SELECT data FROM tSongData WHERE key = ?", key).fetch_one(conn)
+    ).expect("failed to load dat data").data;
+
+    let mut ar = tar::Archive::new(&*data);
+    let mut dats = HashMap::new();
+    for entry in ar.entries().expect("failed to parse dat tar") {
+        let mut entry = entry.expect("failed to decode dat entry");
+        let path_bytes = entry.path_bytes();
+        // Standardise for info.dat to always be lowercase
+        let path = if path_bytes.eq_ignore_ascii_case(b"info.dat") {
+            "info.dat"
+        } else {
+            str::from_utf8(&path_bytes).unwrap()
+        }.to_owned();
+        let mut v = vec![];
+        let path = path.to_owned();
+        entry.read_to_end(&mut v).unwrap();
+        assert!(dats.insert(path, v).is_none())
+    }
+    assert!(!dats.is_empty());
+
+    dats
 }
 
 fn update_search() {

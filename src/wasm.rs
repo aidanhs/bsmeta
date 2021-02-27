@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use log::{trace, debug, info, warn};
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
@@ -1049,7 +1049,7 @@ fn load_module(path: impl AsRef<Path>) -> Result<wasmer::Module> {
     Ok(module)
 }
 
-fn run_plugin(module: Module, mut plugin: tar::Archive<impl Read>, dats: HashMap<String, Vec<u8>>) -> Result<HashMap<String, AnalysisValue>> {
+fn run_plugin(module: Module, mut plugin: tar::Archive<impl Read>, dats: HashMap<String, Vec<u8>>) -> Result<(String, Result<HashMap<String, AnalysisValue>>)> {
     let store = module.store();
 
     let mut rofs = ROFilesystem::new();
@@ -1137,20 +1137,23 @@ fn run_plugin(module: Module, mut plugin: tar::Archive<impl Read>, dats: HashMap
     let f = instance.exports.get_function("_start")?;
     let ret = f.call(&[]);
     let fs = wasi_ctx.fs();
+    let stdout = String::from_utf8_lossy(&fs.stdout);
+    let stderr = String::from_utf8_lossy(&fs.stderr);
     match ret {
         Ok(vals) => {
-            debug!("stdout:{{#\n{}\n#}}", String::from_utf8_lossy(&fs.stdout));
-            debug!("stderr:{{#\n{}\n#}}", String::from_utf8_lossy(&fs.stderr));
+            debug!("stdout:{{#\n{}\n#}}", stdout);
+            debug!("stderr:{{#\n{}\n#}}", stderr);
             debug!("success: {:?}", vals);
-            Ok(serde_json::from_slice(&fs.stdout)
-               .with_context(|| format!("couldn't parse script output: {:?}", String::from_utf8_lossy(&fs.stdout)))?)
+            let res = serde_json::from_slice(&fs.stdout)
+               .with_context(|| format!("couldn't parse script output: {:?}", String::from_utf8_lossy(&fs.stdout)));
+            Ok((stderr.to_string(), res))
         },
         Err(re) => {
             warn!("_start runtime fail: {}", re);
-            warn!("stdout:{{#\n{}\n#}}", String::from_utf8_lossy(&fs.stdout));
-            warn!("stderr:{{#\n{}\n#}}", String::from_utf8_lossy(&fs.stderr));
+            warn!("stdout:{{#\n{}\n#}}", stdout);
+            warn!("stderr:{{#\n{}\n#}}", stderr);
             debug!("trace: {:#?}", re.trace());
-            Err(re).context("failed to run analysis")
+            Ok((stderr.to_string(), Err(anyhow!(re).context(format!("failed to run analysis:\nstdout:{{#\n{}\n#}}\nstderr:{{#\n{}\n#}}", stdout, stderr)))))
         }
     }
 }
@@ -1172,7 +1175,7 @@ pub enum AnalysisValue {
 
 impl AnalysisPlugin {
     /// A plugin will return a map from an arbitrary analysis key -> value
-    pub fn run(&self, dats: HashMap<String, Vec<u8>>) -> Result<HashMap<String, AnalysisValue>> {
+    pub fn run(&self, dats: HashMap<String, Vec<u8>>) -> Result<(String, Result<HashMap<String, AnalysisValue>>)> {
         let ar = tar::Archive::new(&*self.tar_data);
         run_plugin(self.module.clone(), ar, dats)
     }
@@ -1187,6 +1190,15 @@ pub fn load_plugin(plugin_name: &str, interp_path: &Path, plugin_path: &Path) ->
     Ok(AnalysisPlugin {
         module,
         tar_data,
+        name: plugin_name.to_owned(),
+    })
+}
+
+pub fn dynamic_plugin(plugin_name: &str, interp_path: &Path, plugin_data: Vec<u8>) -> Result<AnalysisPlugin> {
+    let module = load_module(interp_path).with_context(|| format!("failed to load interp module {}", interp_path.display()))?;
+    Ok(AnalysisPlugin {
+        module,
+        tar_data: plugin_data,
         name: plugin_name.to_owned(),
     })
 }
@@ -1222,7 +1234,7 @@ pub fn test() -> Result<()> {
             dats.insert(name.to_owned(), fs::read(datpath)?);
         }
         info!("considering {} {:?}", path, names);
-        let ret = plugin.run(dats)?;
+        let ret = plugin.run(dats)?.1?;
         info!("output: {:?}, as json: {}", ret, serde_json::to_string(&ret).unwrap())
     }
     Ok(())

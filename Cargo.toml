@@ -23,6 +23,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 sqlx = { version = "0.4.2", features = [ "runtime-async-std-rustls", "sqlite" ] }
 tar = "0.4"
+tide = "0.16"
 typetag = "0.1"
 zip = "0.5"
 
@@ -37,3 +38,6 @@ wasmer-wasi = "1"
 debug = 1
 overflow-checks = true
 lto = "thin"
+
+[profile.release.package."*"]
+debug = 0

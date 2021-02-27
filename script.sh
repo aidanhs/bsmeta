@@ -10,7 +10,7 @@ OPT=--release
 if [ "$1" = sync ]; then
     shift
     rsync -avrz --progress --partial \
-        ./target/release/bsmeta ./.env \
+        ./target/release/bsmeta ./.env ./static \
         "$1":~/work/bsmeta/
     rsync -avrz --progress --partial --relative \
         ./plugins/dist/ \
@@ -89,8 +89,9 @@ elif [ "$1" = plugins ]; then
         #xxd -i lib.zip lib.zip.h
         cp lib.zip ../dist/
         cd ..
+        wasmcc -c interp-py-redefs.c -o /tmp/interp-py-redefs.o
         # https://github.com/WebAssembly/wasi-libc/issues/233 - size stack-size up!
-        wasicc -Wl,--allow-undefined -Wall -O2 -Icpython -o /tmp/py.wasm interp-py.c cpython/libpython3.5.a cpython/Modules/zlib/libz.a -lwasi-emulated-signal -Wl,-z,stack-size=$((8*1024*1024)) -Wl,--initial-memory=$((32*1024*1024))
+        wasicc -Wl,--allow-undefined -Wall -O2 -Icpython -o /tmp/py.wasm /tmp/interp-py-redefs.o interp-py.c cpython/libpython3.5.a cpython/Modules/zlib/libz.a -lwasi-emulated-signal -Wl,-z,stack-size=$((8*1024*1024)) -Wl,--initial-memory=$((32*1024*1024))
         wasm-opt --fpcast-emu -O0 /tmp/py.wasm -o dist/py.wasm
 
         cd ..

@@ -1,0 +1,324 @@
+<html>
+<head>
+</head>
+<body>
+
+<div id="container"></div>
+
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://fb.me/react-with-addons-15.1.0.js"></script>
+<script src="https://fb.me/react-dom-15.1.0.js"></script>
+<style>
+/*
+html5doctor.com Reset Stylesheet
+v1.6.1
+Last Updated: 2010-09-17
+Author: Richard Clark - http://richclarkdesign.com
+Twitter: @rich_clark
+*/
+
+html, body, div, span, object, iframe,
+h1, h2, h3, h4, h5, h6, p, blockquote, pre,
+abbr, address, cite, code,
+del, dfn, em, img, ins, kbd, q, samp,
+small, strong, sub, sup, var,
+b, i,
+dl, dt, dd, ol, ul, li,
+fieldset, form, label, legend,
+table, caption, tbody, tfoot, thead, tr, th, td,
+article, aside, canvas, details, figcaption, figure,
+footer, header, hgroup, menu, nav, section, summary,
+time, mark, audio, video {
+ margin:0;
+ padding:0;
+ border:0;
+ outline:0;
+ font-size:100%;
+ vertical-align:baseline;
+ background:transparent;
+}
+
+body {
+ line-height:1;
+}
+
+article,aside,details,figcaption,figure,
+footer,header,hgroup,menu,nav,section {
+ display:block;
+}
+
+nav ul {
+ list-style:none;
+}
+
+blockquote, q {
+ quotes:none;
+}
+
+blockquote:before, blockquote:after,
+q:before, q:after {
+ content:'';
+ content:none;
+}
+
+a {
+ margin:0;
+ padding:0;
+ font-size:100%;
+ vertical-align:baseline;
+ background:transparent;
+}
+
+/* change colours to suit your needs */
+ins {
+ background-color:#ff9;
+ color:#000;
+ text-decoration:none;
+}
+
+/* change colours to suit your needs */
+mark {
+ background-color:#ff9;
+ color:#000; 
+ font-style:italic;
+ font-weight:bold;
+}
+
+del {
+ text-decoration: line-through;
+}
+
+abbr[title], dfn[title] {
+ border-bottom:1px dotted;
+ cursor:help;
+}
+
+table {
+ border-collapse:collapse;
+ border-spacing:0;
+}
+
+/* change border colour to suit your needs */
+hr {
+ display:block;
+ height:1px;
+ border:0;
+ border-top:1px solid #cccccc;
+ margin:1em 0;
+ padding:0;
+}
+
+input, select {
+ vertical-align:middle;
+}
+</style>
+<style>
+* {
+    box-sizing: border-box;
+}
+#container {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+}
+#root {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+}
+#root > h1 {
+    position: absolute;
+    top: 0;
+    height: 50px;
+    left: 0;
+    right: 0;
+    padding: 5px;
+    text-align: center;
+}
+#analysis-src {
+    position: absolute;
+    top: 50px;
+    bottom: 0;
+    left: 0;
+    right: 50%;
+}
+#analysis-src > textarea {
+    margin: 2%;
+    height: 95%;
+    width: 95%;
+}
+#results {
+    position: absolute;
+    top: 50px;
+    height: 200px;
+    left: 50%;
+    right: 0;
+    border: solid black 1px;
+    padding: 10px;
+}
+#results > pre {
+    margin-top: 10px;
+    white-space: pre-wrap;
+}
+#song-list {
+    position: absolute;
+    top: 250px;
+    bottom: 0;
+    left: 50%;
+    right: 0;
+    overflow-y: scroll;
+    overflow-x: hidden;
+    border: solid black 1px;
+    padding: 10px;
+}
+</style>
+<script type="text/babel">
+
+const DEFAULT_PY_SCRIPT = `import json
+import sys
+
+def analyse(data):
+    return {
+        'total_notes': len(data['_notes']),
+    }
+
+infodat = json.load(open('/data/info.dat'))
+total_notes = 0
+difficulties = []
+
+print('Loaded info, performing analysis', file=sys.stderr)
+for diff_set in infodat['_difficultyBeatmapSets']:
+    set_name = diff_set['_beatmapCharacteristicName']
+
+    for diff in diff_set['_difficultyBeatmaps']:
+        d = diff['_difficulty']
+        difficulties.append(d)
+        diff_json = json.load(open('/data/' + diff['_beatmapFilename']))
+        res = analyse(diff_json)
+        total_notes += res['total_notes']
+
+print(json.dumps({
+    'total_notes': total_notes,
+    'difficulties': ', '.join(difficulties),
+}))`
+
+const DEFAULT_JS_SCRIPT = `function analyse(data) {
+    return {
+        'total_notes': data._notes.length,
+    }
+}
+
+let infodat = JSON.parse(std.loadFile("/data/info.dat"));
+let total_notes = 0;
+let difficulties = [];
+
+std.err.puts('Loaded info, performing analysis');
+infodat._difficultyBeatmapSets.forEach((diffSet) => {
+    let setName = diffSet._beatmapCharacteristicName;
+    diffSet._difficultyBeatmaps.forEach((diff) => {
+        let d = diff._difficulty;
+        difficulties.push(d);
+        let diff_json = JSON.parse(std.loadFile('/data/' + diff._beatmapFilename));
+        let res = analyse(diff_json);
+        total_notes += res.total_notes;
+    });
+});
+
+std.out.puts(JSON.stringify({
+    total_notes,
+    difficulties: difficulties.join(', '),
+}));`
+
+let DEFAULT_SCRIPT = {
+    'js': DEFAULT_JS_SCRIPT,
+    'py': DEFAULT_PY_SCRIPT,
+};
+
+class Root extends React.Component {
+  constructor(props) {
+    super(props)
+    this.state = {
+      'selected': 0,
+      'script': DEFAULT_SCRIPT['py'],
+      'lang': 'py',
+      'output': '[no analysis run]',
+      'data': [],
+    };
+  }
+
+  componentDidMount() {
+    fetch('/api')
+      .then(response => response.json())
+      .then(data => {
+        this.setState({'data': data});
+        this.handleSubmit();
+      })
+  }
+
+  handleSubmit() {
+    this.setState({'output': '[...loading...]'});
+    fetch('/submit', {
+            headers: { 'Content-Type': 'application/json' },
+            method: 'POST',
+            body: JSON.stringify({
+                'key_str': this.state.data[this.state.selected][0],
+                'interp': this.state.lang,
+                'script': this.state.script
+            })
+        })
+        .then(response => response.text())
+        .then(text => this.setState({'output': text}));
+  }
+
+  render() {
+    let rows = this.state.data.map((d, i) => {
+      return <div key={i}>
+        <input
+          onChange={() => { this.setState({'selected': i}); this.handleSubmit(); }}
+          type="radio" checked={i === this.state.selected} />
+        <a href={"https://bsaber.com/songs/" + d[0]}>{d[0] + ' ' + d[1]}</a>
+      </div>
+    });
+    rows.push(<div key="end">[...]</div>);
+    return (
+      <div id="root">
+        <h1>Welcome to BSMeta</h1>
+        <div id="analysis-src">
+            <textarea onChange={(e) => this.setState({'script': e.value})} value={this.state.script}></textarea>
+        </div>
+        <div id="results">
+            <button onClick={this.handleSubmit}>Submit</button>
+            <select onChange={(e) => {
+                let value = e.target.value;
+                if (value !== this.state.lang) {
+                    this.setState({'lang': value, 'script': DEFAULT_SCRIPT[value]});
+                    this.handleSubmit();
+                }
+            }} value={this.state.lang}>
+                <option value='py'>Python</option>
+                <option value='js'>JavaScript</option>
+            </select>
+            Result:
+            <pre>{this.state.output}</pre>
+        </div>
+        <div id="song-list">
+            {rows}
+        </div>
+      </div>
+    );
+  }
+}
+
+ReactDOM.render(
+  <Root />,
+  document.getElementById('container')
+);
+
+</script>
+
+</body>
+</html>
