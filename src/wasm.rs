@@ -1204,7 +1204,7 @@ pub fn dynamic_plugin(plugin_name: &str, interp_path: &Path, plugin_data: Vec<u8
 }
 
 pub fn test() -> Result<()> {
-    let plugin = load_plugin("parity", "plugins/dist/py.wasm".as_ref(), "plugins/dist/difficulty.tar".as_ref())?;
+    let plugin = load_plugin("difficulty", "plugins/dist/py.wasm".as_ref(), "plugins/dist/difficulty.tar".as_ref())?;
     //let plugin = load_plugin("parity", "plugins/dist/js.wasm".as_ref(), "plugins/dist/parity.tar".as_ref())?;
 
     let paths = &[

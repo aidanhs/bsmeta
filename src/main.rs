@@ -225,7 +225,7 @@ fn analyse_songs() {
         println!("Loading plugin {}", name);
         let interp_path = format!("plugins/dist/{}.wasm", interp);
         let plugin_path = format!("plugins/dist/{}.tar", name);
-        let plugin = wasm::load_plugin("parity", interp_path.as_ref(), plugin_path.as_ref()).expect("failed to load plugin");
+        let plugin = wasm::load_plugin(&name, interp_path.as_ref(), plugin_path.as_ref()).expect("failed to load plugin");
         analyses.push(plugin)
     }
 
