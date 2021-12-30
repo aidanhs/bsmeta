@@ -7,6 +7,8 @@ set -o xtrace
 OPT=
 OPT=--release
 
+export RUST_LOG=bsmeta=trace
+
 if [ "$1" = sync ]; then
     shift
     rsync -avrz --progress --partial \
@@ -36,8 +38,9 @@ elif [ "$1" = run ]; then
 
 elif [ "$1" = mkdb ]; then
     . .env
-    rm "$DATABASE_URL"
-    sqlite3 "$DATABASE_URL" <schema.sql
+    db="$(echo "$DATABASE_URL" | sed 's/^sqlite://g')"
+    rm -f "$db"
+    sqlite3 "$db" <schema.sql
 
 elif [ "$1" = plugins ]; then
     shift

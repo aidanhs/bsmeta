@@ -1,36 +1,39 @@
 -- Your SQL goes here
 
 PRAGMA encoding = 'UTF-8';
+PRAGMA foreign_keys = ON;
 
 CREATE TABLE tSong (
-    key        INTEGER PRIMARY KEY NOT NULL  CHECK (typeof(key) = 'integer'),
-    -- TODO: there's a hash in here that's just '-' ???
-    hash       TEXT                          CHECK (typeof(hash) = 'text' OR hash IS NULL),
-    tstamp     BIGINT NOT NULL               CHECK (typeof(tstamp) = 'integer'),
-    deleted    BOOLEAN NOT NULL DEFAULT 0    CHECK (typeof(deleted) = 'integer'),
-    -- Beatsaver JSON
-    bsmeta     BLOB                          CHECK (typeof(bsmeta) = 'blob' OR bsmeta IS NULL),
-    -- TODO: once I have old metas, augment this check constraint to have a hash+bsmeta when deleted = 0
-    CHECK (deleted = 0 OR deleted = 1)
+    key     INTEGER PRIMARY KEY NOT NULL CHECK (typeof(key) = 'integer'),
+    deleted BOOLEAN NOT NULL DEFAULT 0   CHECK (typeof(deleted) = 'integer' AND (deleted = 0 OR deleted = 1)),
+    tstamp  BIGINT NOT NULL              CHECK (typeof(tstamp) = 'integer')
 );
--- TODO: figure why this can't be unique
-CREATE INDEX iSong1 ON tSong(hash);
 
-CREATE TABLE tSongData (
-    key        INTEGER PRIMARY KEY NOT NULL CHECK (typeof(key) = 'integer'),
-    -- Raw zip data
-    zipdata    BLOB                NOT NULL CHECK (typeof(zipdata) = 'blob'),
-    -- A tar of just the .dat files
-    data       BLOB                NOT NULL CHECK (typeof(data) = 'blob'),
-    -- My derived extra meta
-    extra_meta BLOB                NOT NULL CHECK (typeof(extra_meta) = 'blob'),
+-- These may not exist if the song has been deleted
+CREATE TABLE tSongMeta (
+    key    INTEGER PRIMARY KEY NOT NULL  CHECK (typeof(key) = 'integer'),
+    hash   TEXT NOT NULL                 CHECK (typeof(hash) = 'text'),
+    -- Beatsaver JSON
+    bsmeta BLOB NOT NULL                 CHECK (typeof(bsmeta) = 'blob'),
     FOREIGN KEY (key) REFERENCES tSong(key)
+);
+
+-- TODO: these aren't really freestanding, but hash is not a primary key of tSongMeta
+-- so we can't reference it as a foreign key
+CREATE TABLE tSongData (
+    hash       TEXT PRIMARY KEY NOT NULL CHECK (typeof(hash) = 'text'),
+    -- Raw zip data
+    zipdata    BLOB NOT NULL             CHECK (typeof(zipdata) = 'blob'),
+    -- A tar of just the .dat files
+    data       BLOB NOT NULL             CHECK (typeof(data) = 'blob'),
+    -- My derived extra meta
+    extra_meta BLOB NOT NULL             CHECK (typeof(extra_meta) = 'blob')
 );
 
 CREATE TABLE tSongAnalysis (
-    key           INTEGER NOT NULL CHECK (typeof(key) = 'integer'),
-    analysis_name TEXT NOT NULL    CHECK (typeof(analysis_name) = 'text'),
-    result        BLOB NOT NULL    CHECK (typeof(result) = 'blob'),
-    PRIMARY KEY (key, analysis_name),
-    FOREIGN KEY (key) REFERENCES tSong(key)
+    hash          TEXT NOT NULL CHECK (typeof(hash) = 'text'),
+    analysis_name TEXT NOT NULL CHECK (typeof(analysis_name) = 'text'),
+    result        BLOB NOT NULL CHECK (typeof(result) = 'blob'),
+    PRIMARY KEY (hash, analysis_name),
+    FOREIGN KEY (hash) REFERENCES tSongData(hash)
 );

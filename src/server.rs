@@ -1,14 +1,12 @@
 use async_std::task;
 use std::convert::TryInto;
 use std::fs;
-use std::str::FromStr;
-use sqlx::prelude::*;
 use sqlx::query;
 use tide::{Body, Request, StatusCode};
 use tide::prelude::*;
 
 use super::BeatSaverMap;
-use super::{establish_connection, load_dats_for_analysis, num_to_key, key_to_num};
+use super::{establish_connection, load_dats_for_analysis, num_to_key};
 
 //async fn index(req: Request<()>) -> tide::Result {
 //    let mut res: tide::Response = "\
@@ -27,19 +25,19 @@ use super::{establish_connection, load_dats_for_analysis, num_to_key, key_to_num
 async fn api(_req: Request<()>) -> tide::Result {
     let conn = &establish_connection();
     let results: Vec<_> = query!("
-        SELECT s.key, s.bsmeta
-        FROM tSong s, tSongData sd
+        SELECT s.key, sm.hash, sm.bsmeta
+        FROM tSong s, tSongMeta sm, tSongData sd
         WHERE
             s.deleted = false AND
-            s.bsmeta IS NOT NULL AND
-            s.key = sd.key
+            s.key = sm.key AND
+            sm.hash = sd.hash
         ORDER BY s.key DESC
         LIMIT 100
     ").fetch_all(conn).await.unwrap();
-    let results: Vec<_> = results.into_iter()
+    let results: Vec<(String, String, String)> = results.into_iter()
         .map(|result| {
-            let bsmeta: BeatSaverMap = serde_json::from_slice(&result.bsmeta.unwrap()/*TODO:remove unwrap*/).unwrap();
-            (num_to_key(result.key), format!("{} {}", bsmeta.metadata.song_name, bsmeta.metadata.song_sub_name))
+            let bsmeta: BeatSaverMap = serde_json::from_slice(&result.bsmeta).unwrap();
+            (num_to_key(result.key), result.hash, format!("{} {}", bsmeta.metadata.song_name, bsmeta.metadata.song_sub_name))
         })
         .collect();
     Ok(Body::from_json(&results)?.into())
@@ -48,11 +46,11 @@ async fn api(_req: Request<()>) -> tide::Result {
 async fn submit(mut req: Request<()>) -> tide::Result {
     #[derive(Deserialize)]
     struct AnalysisSubmit {
-        key_str: String,
+        hash: String,
         interp: String,
         script: String,
     }
-    let AnalysisSubmit { key_str, interp, script } = req.body_json().await?;
+    let AnalysisSubmit { hash, interp, script } = req.body_json().await?;
 
     let (base_plugin, to_replace) = match interp.as_str() {
         "js" => ("parity", "script.js"),
@@ -85,7 +83,7 @@ async fn submit(mut req: Request<()>) -> tide::Result {
     }
     let plugin = super::wasm::dynamic_plugin("dynamic", interp_path.as_ref(), tar_data).unwrap();
     let conn = &establish_connection();
-    let dats = load_dats_for_analysis(conn, key_to_num(&key_str));
+    let dats = load_dats_for_analysis(conn, &hash);
     let ret = match plugin.run(dats) {
         Ok((stderr, Ok(d))) => format!("success: {}\n\nstderr:{{#\n{}\n#}}", serde_json::to_string(&d).unwrap(), stderr),
         Ok((stderr, Err(e))) => format!("error: {}\n\nstderr:{{#\n{}\n#}}", e, stderr),
