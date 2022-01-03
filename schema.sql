@@ -17,6 +17,7 @@ CREATE TABLE tSongMeta (
     bsmeta BLOB NOT NULL                 CHECK (typeof(bsmeta) = 'blob'),
     FOREIGN KEY (key) REFERENCES tSong(key)
 );
+CREATE INDEX iSongMeta1 ON tSongMeta(hash);
 
 -- TODO: these aren't really freestanding, but hash is not a primary key of tSongMeta
 -- so we can't reference it as a foreign key
